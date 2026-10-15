@@ -1,0 +1,5 @@
+# Shadows zeitgeist's full-text indexer (the session bus prefers /usr/local/share): it is one more
+# long-running process towards Android's limit of 32, for search history nobody sees here.
+[D-BUS Service]
+Name=org.gnome.zeitgeist.SimpleIndexer
+Exec=/bin/false

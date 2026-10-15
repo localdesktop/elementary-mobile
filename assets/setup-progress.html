@@ -3,185 +3,203 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Welcome to Local Desktop</title>
-    <script src="https://cdn.jsdelivr.net/npm/vue@2/dist/vue.js"></script>
+    <title>Setting up elementary OS</title>
+    <!-- Shown by the app on first launch while it unpacks the bundled OS. Must work offline:
+         no external scripts, fonts or frames. Progress arrives over a WebSocket from the app. -->
     <style>
-      ::selection {
-        background-color: rgba(144, 238, 144, 0.5);
+      :root {
+        --bg: #fafafa;
+        --fg: #333333;
+        --muted: #7e8087;
+        --track: #d4d4d4;
+        --accent: #3689e6;
+        --error: #c6262e;
+        --log-bg: #f2f2f2;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #2b2b2b;
+          --fg: #fafafa;
+          --muted: #abacae;
+          --track: #4d4d4d;
+          --accent: #64baff;
+          --error: #ed5353;
+          --log-bg: #1f1f1f;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: "Inter", "Roboto", system-ui, sans-serif;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100%;
+        padding: 24px 16px;
+        gap: 16px;
+        text-align: center;
+      }
+      .logo {
+        width: 72px;
+        height: 72px;
+        color: var(--accent);
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.5rem;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+        max-width: 32rem;
+        line-height: 1.5;
+      }
+      .bar {
+        width: min(28rem, 100%);
+        height: 6px;
+        border-radius: 3px;
+        background: var(--track);
+        overflow: hidden;
+      }
+      .bar > div {
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.3s ease;
+      }
+      .error .bar > div {
+        background: var(--error);
+      }
+      #status {
+        min-height: 1.5em;
+        font-variant-numeric: tabular-nums;
+        overflow-wrap: anywhere;
+      }
+      .error #status {
+        color: var(--error);
+      }
+      button {
+        border: none;
+        background: none;
+        color: var(--accent);
+        font: inherit;
+        padding: 8px;
+        cursor: pointer;
+      }
+      #log {
+        display: none;
+        width: min(40rem, 100%);
+        max-height: 40vh;
+        overflow-y: auto;
+        margin: 0;
+        padding: 12px;
+        border-radius: 8px;
+        background: var(--log-bg);
+        font: 12px/1.5 ui-monospace, "Roboto Mono", monospace;
+        text-align: left;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .show-log #log {
+        display: block;
+      }
+      .log-error {
+        color: var(--error);
       }
     </style>
   </head>
 
-  <body style="margin: 0">
-    <div
-      style="display: flex; flex-direction: column; height: 100vh; width: 100vw"
-    >
-      <div style="flex: 1; position: relative">
-        <iframe
-          sandbox="allow-same-origin allow-popups allow-top-navigation-by-user-activation"
-          src="https://localdesktop.github.io/docs/user/getting-started"
-          style="border: none; width: 100%; height: 100%"
-        ></iframe>
-        <div
-          v-if="showFullLog"
-          style="
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            overflow-y: auto;
-            background-color: rgba(30, 30, 30);
-            color: white;
-            font-family: monospace;
-            padding: 10px;
-            z-index: 1;
-            display: flex;
-            flex-direction: column-reverse; /* Reverse the order of logs */
-          "
-        >
-          <div
-            v-for="log in logs"
-            :key="log.id"
-            :style="{
-              display: 'flex',
-              flex: 'none',
-              marginBottom: '5px',
-              color: log.isError ? '#ff0000' : 'white'
-            }"
-          >
-            <div
-              style="
-                color: gray;
-                font-weight: bold;
-                margin-right: 10px;
-                flex-shrink: 0;
-              "
-            >
-              {{ new Date(log.timestamp).toLocaleTimeString() }}
-            </div>
-            <!-- Prettier may append line breaks/indents before and after the message. And white-space: pre-wrap will show all these line breaks/indents to the user. So we must turn it off for the next line -->
-            <!-- prettier-ignore -->
-            <div style="flex: 1; white-space: pre-wrap">{{ log.message }}</div>
-          </div>
-        </div>
+  <body>
+    <main id="app">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
+        <path d="M9 20h6M12 16v4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+      </svg>
+      <h1 id="title">Setting up elementary OS</h1>
+      <p id="subtitle">
+        This happens once and needs no internet connection. It usually takes a minute or two.
+      </p>
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div id="bar"></div>
       </div>
-      <div
-        @click="toggleView"
-        style="
-          position: relative;
-          flex: none;
-          padding: 10px;
-          background-color: black;
-          font-family: monospace;
-          display: flex;
-          justify-content: space-between;
-          color: white;
-          cursor: pointer;
-          -webkit-tap-highlight-color: transparent;
-          user-select: none;
-        "
-      >
-        <div
-          :style="{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            height: '100%',
-            width: progress + '%',
-            backgroundColor: progressBarColor,
-            zIndex: 0
-          }"
-        ></div>
-        <span
-          style="
-            flex: 1;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            position: relative;
-            z-index: 1;
-            padding-right: 12px;
-          "
-        >
-          {{ message }}
-        </span>
-        <span style="flex: none; position: relative; z-index: 1"
-          ><span>{{ progress }}</span>%
-        </span>
-      </div>
-    </div>
+      <p id="status">Connecting…</p>
+      <button id="toggle" type="button">Show details</button>
+      <pre id="log"></pre>
+    </main>
 
     <script>
-      new Vue({
-        el: "body > div",
-        data() {
-          return {
-            showFullLog: false,
-            progress: 0,
-            logs: [],
-            logCounter: 0,
-            hasError: false,
-          };
-        },
-        computed: {
-          message() {
-            return this.logs.length > 0
-              ? this.logs[0].message
-              : "Installing...";
-          },
-          progressBarColor() {
-            return this.hasError ? "#ff0000" : "#006400";
-          },
-        },
-        methods: {
-          toggleView() {
-            this.showFullLog = !this.showFullLog;
-          },
-          handleWebSocketMessage(data) {
-            this.progress = data.progress;
+      const app = document.getElementById("app");
+      const title = document.getElementById("title");
+      const subtitle = document.getElementById("subtitle");
+      const bar = document.getElementById("bar");
+      const progressbar = bar.parentElement;
+      const statusLine = document.getElementById("status");
+      const log = document.getElementById("log");
+      const toggle = document.getElementById("toggle");
+      const MAX_LOG_LINES = 200;
 
-            const isError = data.isError || false;
-            this.hasError = isError;
-
-            if (this.progress === 100 && !this.hasError) {
-              alert("Installation finished, please restart the app!");
-            }
-
-            this.logs.unshift({
-              id: this.logCounter++,
-              timestamp: Date.now(),
-              message: data.message,
-              isError: isError,
-            });
-            if (this.logs.length > 100) {
-              this.logs.pop();
-            }
-          },
-        },
-        mounted() {
-          const params = new URLSearchParams(window.location.search);
-          const port = params.get("port");
-          const ws = new WebSocket(`ws://127.0.0.1:${port}`, "rust-websocket");
-
-          ws.onopen = () => {
-            console.log("WebSocket connection established");
-          };
-
-          ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            this.handleWebSocketMessage(data);
-          };
-
-          ws.onclose = () => {
-            console.log("WebSocket connection closed");
-          };
-
-          ws.onerror = (error) => {
-            console.error("WebSocket error:", error);
-          };
-        },
+      toggle.addEventListener("click", () => {
+        const shown = app.classList.toggle("show-log");
+        toggle.textContent = shown ? "Hide details" : "Show details";
       });
+
+      function appendLog(message, isError) {
+        const line = document.createElement("div");
+        const time = new Date().toLocaleTimeString();
+        line.textContent = `${time}  ${message}`;
+        if (isError) line.className = "log-error";
+        log.appendChild(line);
+        while (log.childElementCount > MAX_LOG_LINES) log.firstChild.remove();
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function showProgress({ progress, message, isError }) {
+        // `progress` counts finished setup stages, but nearly all the time goes into the first
+        // one (unpacking the OS), which reports its own percentage in the message.
+        const stagePercent = /(\d+)%/.exec(message);
+        const overall = Number(progress) || 0;
+        const reported = stagePercent && overall < 100 ? Number(stagePercent[1]) : overall;
+        const percent = Math.max(0, Math.min(100, reported));
+        bar.style.width = `${percent}%`;
+        progressbar.setAttribute("aria-valuenow", String(percent));
+        statusLine.textContent = message;
+        appendLog(message, isError);
+
+        if (isError) {
+          app.classList.add("error");
+          title.textContent = "Setup could not finish";
+          subtitle.textContent =
+            "Close the app and open it again to retry. Your files are not affected.";
+        } else if (percent === 100) {
+          title.textContent = "Starting elementary OS";
+          subtitle.textContent = "The desktop will appear in a moment.";
+        }
+      }
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("missing-os")) {
+        showProgress({
+          progress: 0,
+          message:
+            "This build of the app does not include elementary OS. Build it with scripts/build-rootfs.sh, then rebuild the APK.",
+          isError: true,
+        });
+        subtitle.textContent = "The app cannot start without its bundled operating system.";
+      } else {
+        const ws = new WebSocket(`ws://127.0.0.1:${params.get("port")}`, "rust-websocket");
+        ws.onmessage = (event) => showProgress(JSON.parse(event.data));
+        ws.onerror = () => appendLog("Lost connection to the installer", true);
+      }
     </script>
   </body>
 </html>

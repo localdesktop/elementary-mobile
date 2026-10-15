@@ -289,9 +289,13 @@ impl<T: 'static> EventLoop<T> {
                     warn!("TODO: forward onStop notification to application");
                 },
                 MainEvent::Destroy => {
-                    // XXX: maybe exit mainloop to drop things before being
-                    // killed by the OS?
-                    warn!("TODO: forward onDestroy notification to application");
+                    // NativeActivity.onDestroy blocks until android_main returns, and this event
+                    // loop never does, so the app froze with "isn't responding" whenever Android
+                    // recreated the activity (e.g. a window configuration change). The compositor
+                    // and the guest session are tied to this process anyway: end it, and Android
+                    // starts a fresh one for the new activity.
+                    warn!("Activity destroyed, exiting the process");
+                    std::process::exit(0);
                 },
                 MainEvent::InsetsChanged { .. } => {
                     // XXX: how to forward this state to applications?

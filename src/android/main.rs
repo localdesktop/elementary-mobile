@@ -3,7 +3,7 @@ use crate::{
         accessibility::{register_event_loop_proxy, AppUserEvent},
         app::build::PolarBearApp,
         utils::{
-            application_context::ApplicationContext,
+            application_context::{get_application_context, ApplicationContext},
             fullscreen_immersive::{enable_fullscreen_immersive_mode, keep_screen_on},
             ndk::run_in_jvm,
         },
@@ -19,17 +19,17 @@ use winit::{
 #[no_mangle]
 fn android_main(android_app: AndroidApp) {
     std::env::set_var("RUST_BACKTRACE", "full");
-    let _guard = sentry::init((
-        config::SENTRY_DSN,
+    let _guard = config::SENTRY_DSN.map(|dsn| sentry::init((
+        dsn,
         sentry::ClientOptions {
             release: sentry::release_name!(),
             // Capture user IPs and potentially sensitive headers when using HTTP server integrations
             // see https://docs.sentry.io/platforms/rust/data-management/data-collected for more info
-            send_default_pii: true,
+            send_default_pii: false,
             enable_logs: true,
             ..Default::default()
         },
-    ));
+    )));
 
     // Wrap the Android logger with Sentry's logger
     let logger = SentryLogger::with_dest(android_logger::AndroidLogger::default()).filter(|md| {
@@ -59,6 +59,12 @@ fn android_main(android_app: AndroidApp) {
     }
 
     ApplicationContext::build(&android_app);
+
+    // The bundled libxkbcommon was compiled with upstream's paths (app.polarbear/files/arch).
+    // Point it at this app's root filesystem instead, or the compositor cannot build a keymap.
+    let rootfs_dir = get_application_context().rootfs_dir;
+    std::env::set_var("XKB_CONFIG_ROOT", rootfs_dir.join("usr/share/X11/xkb"));
+    std::env::set_var("XLOCALEDIR", rootfs_dir.join("usr/share/X11/locale"));
 
     run_in_jvm(enable_fullscreen_immersive_mode, android_app.clone());
     run_in_jvm(keep_screen_on, android_app.clone());

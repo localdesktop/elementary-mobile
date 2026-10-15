@@ -1,5 +1,4 @@
 use crate::android::utils::application_context::get_application_context;
-use crate::core::config;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -13,19 +12,19 @@ pub type Log = Arc<dyn Fn(String) + Send + Sync>;
 
 const SUPPORT_CHECK_BINARY: &str = "ld-linux-aarch64.so.1";
 
-/// Runs a shell command inside the Arch Linux PRoot environment.
+/// Runs a shell command inside the guest OS under PRoot.
 ///
 /// - `command`: The shell command to execute (passed to `sh -c`).
 /// - `user`: The user to run as. Defaults to `"root"` when `None`.
 /// - `log`: Optional stdout line callback. When set, stdout is streamed line-by-line
 ///   to the callback. When `None`, stdout/stderr are captured.
-pub struct ArchProcess {
+pub struct GuestProcess {
     pub command: String,
     pub user: Option<String>,
     pub log: Option<Log>,
 }
 
-impl ArchProcess {
+impl GuestProcess {
     fn ensure_support_probe_rootfs(android_app: &AndroidApp) -> Option<()> {
         let context = get_application_context();
         let probe_exec = context.data_dir.join(SUPPORT_CHECK_BINARY);
@@ -102,6 +101,12 @@ impl ArchProcess {
     pub fn run(self) -> Output {
         let context = get_application_context();
         let user = self.user.as_deref().unwrap_or("root");
+        let rootfs = context.rootfs_dir.display().to_string();
+        let home = if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{user}")
+        };
 
         let mut process = Command::new(context.native_library_dir.join("libproot.so"));
         process
@@ -109,11 +114,11 @@ impl ArchProcess {
                 "PROOT_LOADER",
                 context.native_library_dir.join("libproot_loader.so"),
             )
-            .env("PROOT_TMP_DIR", context.data_dir);
+            .env("PROOT_TMP_DIR", &context.data_dir);
 
         process
             .arg("-r")
-            .arg(config::ARCH_FS_ROOT)
+            .arg(&rootfs)
             .arg("-L")
             .arg("--link2symlink")
             .arg("--sysvipc")
@@ -122,18 +127,21 @@ impl ArchProcess {
             .arg("--bind=/dev")
             .arg("--bind=/proc")
             .arg("--bind=/sys")
-            .arg(format!("--bind={}/tmp:/dev/shm", config::ARCH_FS_ROOT))
+            .arg(format!("--bind={rootfs}/tmp:/dev/shm"))
             // /dev/pts and /dev/ptmx are already covered by --bind=/dev above.
             // The explicit sub-binds added in commit 61d9079 were redundant and caused
             // proot to double-translate PTY ioctls (TIOCGPTN/TIOCSPTLCK/TIOCSWINSZ),
             // breaking terminal initialisation and keyboard arrow keys inside QTerminal.
             // We only need /dev/tty explicitly for processes that open it by path.
-            .arg("--bind=/dev/tty:/dev/tty");
+            .arg("--bind=/dev/tty:/dev/tty")
+            // User data and settings live outside the OS so that an update replacing it keeps them.
+            .arg(format!("--bind={}:/home", context.home_dir.display()))
+            .arg(format!("--bind={}:/etc/localdesktop", context.config_dir.display()));
 
         if context.permission_all_files_access {
             process
                 .arg("--bind=/sdcard:/android")
-                .arg("--bind=/sdcard:/root/Android");
+                .arg(format!("--bind=/sdcard:{home}/Android"));
         }
 
         process
@@ -142,21 +150,20 @@ impl ArchProcess {
             .arg("--bind=/proc/self/fd/0:/dev/stdin")
             .arg("--bind=/proc/self/fd/1:/dev/stdout")
             .arg("--bind=/proc/self/fd/2:/dev/stderr")
-            .arg(format!("--bind={}/proc/.loadavg:/proc/loadavg", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.stat:/proc/stat", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.uptime:/proc/uptime", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.version:/proc/version", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.vmstat:/proc/vmstat", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.sysctl_entry_cap_last_cap:/proc/sys/kernel/cap_last_cap", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/proc/.sysctl_inotify_max_user_watches:/proc/sys/fs/inotify/max_user_watches", config::ARCH_FS_ROOT))
-            .arg(format!("--bind={}/sys/.empty:/sys/fs/selinux", config::ARCH_FS_ROOT));
+            .arg(format!("--bind={rootfs}/proc/.loadavg:/proc/loadavg"))
+            .arg(format!("--bind={rootfs}/proc/.stat:/proc/stat"))
+            .arg(format!("--bind={rootfs}/proc/.uptime:/proc/uptime"))
+            .arg(format!("--bind={rootfs}/proc/.version:/proc/version"))
+            .arg(format!("--bind={rootfs}/proc/.vmstat:/proc/vmstat"))
+            .arg(format!("--bind={rootfs}/proc/.sysctl_entry_cap_last_cap:/proc/sys/kernel/cap_last_cap"))
+            .arg(format!("--bind={rootfs}/proc/.sysctl_inotify_max_user_watches:/proc/sys/fs/inotify/max_user_watches"))
+            .arg(format!("--bind={rootfs}/sys/.empty:/sys/fs/selinux"));
 
         // env vars
         process.arg("/usr/bin/env").arg("-i");
-        if user == "root" {
-            process.arg("HOME=/root");
-        } else {
-            process.arg(format!("HOME=/home/{}", user));
+        process.arg(format!("HOME={home}"));
+        if let Some(timezone) = &context.timezone {
+            process.arg(format!("TZ={timezone}"));
         }
         process
             .arg("LANG=C.UTF-8")

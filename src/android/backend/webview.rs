@@ -10,6 +10,8 @@ use websocket::OwnedMessage;
 pub enum ErrorVariant {
     None,
     Unsupported,
+    /// The APK was built without the bundled OS (scripts/build-rootfs.sh was not run).
+    MissingOs,
 }
 
 pub struct WebviewBackend {

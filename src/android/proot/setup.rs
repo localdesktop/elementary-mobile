@@ -1,26 +1,26 @@
-use super::process::ArchProcess;
+use super::process::GuestProcess;
 use crate::{
     android::{
+        accessibility::{send_user_event, AppUserEvent},
         app::build::PolarBearBackend,
         backend::{
             wayland::{Compositor, TouchMode, WaylandBackend},
             webview::{ErrorVariant, WebviewBackend},
         },
         utils::application_context::get_application_context,
-        utils::ndk::{density_dpi, long_press_timeout_ms, scale_factor, touch_slop_px},
+        utils::ndk::{long_press_timeout_ms, run_in_jvm, scale_factor, touch_slop_px},
     },
-    core::config::{
-        CommandConfig, ARCH_FS_ARCHIVE, ARCH_FS_ROOT, DOCS_HOME_URL, PIPEWIRE_GUEST_RUNTIME_DIR,
-        PULSE_GUEST_SERVER,
-    },
+    core::rootfs::{self, RootfsManifest, ROOTFS_ARCHIVE, ROOTFS_MANIFEST},
 };
+use jni::objects::{JObject, JString};
 use pathdiff::diff_paths;
 use smithay::utils::Clock;
 use std::{
-    fs::{self, File},
-    io::{ErrorKind, Read, Write},
+    ffi::CString,
+    fs,
+    io::{BufReader, ErrorKind, Read},
     os::unix::fs::{symlink, PermissionsExt},
-    path::{Path, PathBuf},
+    path::Path,
     process,
     sync::{
         mpsc::{self, Sender},
@@ -29,9 +29,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tar::Archive;
 use winit::platform::android::activity::AndroidApp;
-use xz2::read::XzDecoder;
 
 #[derive(Debug)]
 pub enum SetupMessage {
@@ -42,6 +40,8 @@ pub enum SetupMessage {
 pub struct SetupOptions {
     pub android_app: AndroidApp,
     pub mpsc_sender: Sender<SetupMessage>,
+    /// The OS this APK carries.
+    pub manifest: RootfsManifest,
 }
 
 /// Setup is a process that should be done **only once** when the user installed the app.
@@ -55,131 +55,92 @@ type SetupStage = Box<dyn Fn(&SetupOptions) -> StageOutput + Send>;
 ///
 /// For coding agents: READ THIS BEFORE ADDING WORK HERE.
 /// - Heavy/long work belongs inside the spawned thread of a returned `Some(JoinHandle)`, so it runs once at install and surfaces as setup progress.
-/// - Simple/light tasks or important settings that must be run every launch (e.g. the Firefox config) can be done inline on the `None` path.
+/// - Simple/light tasks or important settings that must be run every launch can be done inline on the `None` path.
 type StageOutput = Option<JoinHandle<()>>;
 
-const PIPEWIRE_GUEST_LOCK_PACKAGES: &[&str] = &[
-    "libpipewire",
-    "pipewire",
-    "pipewire-alsa",
-    "pipewire-audio",
-    "pipewire-jack",
-    "pipewire-pulse",
-    "pipewire-v4l2",
-    "pipewire-zeroconf",
-    "gst-plugin-pipewire",
-    "wireplumber",
-];
+/// Public resolvers used when Android does not tell us its own.
+const FALLBACK_NAMESERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
 
-fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
+fn read_manifest(android_app: &AndroidApp) -> Option<RootfsManifest> {
+    let name = CString::new(ROOTFS_MANIFEST).ok()?;
+    let mut asset = android_app.asset_manager().open(&name)?;
+    let mut json = Vec::new();
+    asset.read_to_end(&mut json).ok()?;
+    RootfsManifest::parse(&json)
+        .map_err(|e| log::error!("Invalid {ROOTFS_MANIFEST}: {e}"))
+        .ok()
+}
+
+/// Unpack the OS bundled in the APK: on first launch, and after an update that carries a new one.
+fn setup_rootfs(options: &SetupOptions) -> StageOutput {
     let context = get_application_context();
-    let temp_file = context.data_dir.join("archlinux-fs.tar.xz");
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let extracted_dir = context.data_dir.join("archlinux-aarch64");
+    let rootfs_dir = context.rootfs_dir.clone();
+    let manifest = options.manifest.clone();
+
+    if rootfs::is_installed(&rootfs_dir, &manifest) {
+        return None;
+    }
+
+    let android_app = options.android_app.clone();
     let mpsc_sender = options.mpsc_sender.clone();
+    Some(thread::spawn(move || {
+        let action = if rootfs_dir.exists() {
+            "Updating"
+        } else {
+            "Unpacking"
+        };
+        let total = manifest.uncompressed_size.max(1);
+        let total_mb = total as f64 / 1024.0 / 1024.0;
+        mpsc_sender
+            .send(SetupMessage::Progress(format!(
+                "{action} elementary OS ({total_mb:.0} MB)..."
+            )))
+            .unwrap_or(());
 
-    // Only run if the fs_root is missing or empty
-    // TODO: Setup integration test to make sure on clean install, the fs_root is either non existent or empty
-    let need_setup = fs_root.read_dir().map_or(true, |mut d| d.next().is_none());
-    if need_setup {
-        return Some(thread::spawn(move || {
-            // Download if the archive doesn't exist
-            loop {
-                if !temp_file.exists() {
+        let name = CString::new(ROOTFS_ARCHIVE).expect("asset name has no NUL bytes");
+        let asset = android_app
+            .asset_manager()
+            .open(&name)
+            .unwrap_or_else(|| panic!("This APK does not contain {ROOTFS_ARCHIVE}"));
+
+        let mut last_percent = None;
+        let result = rootfs::install(
+            BufReader::with_capacity(1 << 20, asset),
+            &rootfs_dir,
+            &manifest,
+            |read| {
+                let percent = (read * 100 / total).min(100);
+                if last_percent != Some(percent) {
+                    last_percent = Some(percent);
                     mpsc_sender
-                        .send(SetupMessage::Progress(
-                            "Downloading Arch Linux FS...".to_string(),
-                        ))
-                        .expect("Failed to send log message");
-
-                    let response = reqwest::blocking::get(ARCH_FS_ARCHIVE)
-                        .expect("Failed to download Arch Linux FS");
-
-                    let total_size = response.content_length().unwrap_or(0);
-                    let mut file = File::create(&temp_file)
-                        .expect("Failed to create temp file for Arch Linux FS");
-
-                    let mut downloaded = 0u64;
-                    let mut buffer = [0u8; 8192];
-                    let mut reader = response;
-                    let mut last_percent = 0;
-
-                    loop {
-                        let n = reader
-                            .read(&mut buffer)
-                            .expect("Failed to read from response");
-                        if n == 0 {
-                            break;
-                        }
-                        file.write_all(&buffer[..n])
-                            .expect("Failed to write to file");
-                        downloaded += n as u64;
-                        if total_size > 0 {
-                            let percent = (downloaded * 100 / total_size).min(100) as u8;
-                            if percent != last_percent {
-                                let downloaded_mb = downloaded as f64 / 1024.0 / 1024.0;
-                                let total_mb = total_size as f64 / 1024.0 / 1024.0;
-                                mpsc_sender
-                                    .send(SetupMessage::Progress(format!(
-                                        "Downloading Arch Linux FS... {}% ({:.2} MB / {:.2} MB)",
-                                        percent, downloaded_mb, total_mb
-                                    )))
-                                    .unwrap_or(());
-                                last_percent = percent;
-                            }
-                        }
-                    }
-                }
-
-                mpsc_sender
-                    .send(SetupMessage::Progress(
-                        "Extracting Arch Linux FS...".to_string(),
-                    ))
-                    .expect("Failed to send log message");
-
-                // Ensure the extracted directory is clean
-                let _ = fs::remove_dir_all(&extracted_dir);
-
-                // Extract tar file directly to the final destination
-                let tar_file =
-                    File::open(&temp_file).expect("Failed to open downloaded Arch Linux FS file");
-                let tar = XzDecoder::new(tar_file);
-                let mut archive = Archive::new(tar);
-
-                // Try to extract, if it fails, remove temp file and restart download
-                if let Err(e) = archive.unpack(context.data_dir.clone()) {
-                    // Clean up the failed extraction
-                    let _ = fs::remove_dir_all(&extracted_dir);
-                    let _ = fs::remove_file(&temp_file);
-
-                    mpsc_sender
-                        .send(SetupMessage::Error(format!(
-                            "Failed to extract Arch Linux FS: {}. Restarting download...",
-                            e
+                        .send(SetupMessage::Progress(format!(
+                            "{action} elementary OS... {percent}% ({:.0} MB / {total_mb:.0} MB)",
+                            read as f64 / 1024.0 / 1024.0
                         )))
                         .unwrap_or(());
-
-                    // Continue the outer loop to retry the download
-                    continue;
                 }
+            },
+        );
 
-                // If we get here, extraction was successful
-                break;
-            }
-
-            // Move the extracted files to the final destination
-            fs::rename(&extracted_dir, fs_root)
-                .expect("Failed to rename extracted files to final destination");
-
-            // Clean up the temporary file
-            fs::remove_file(&temp_file).expect("Failed to remove temporary file");
-        }));
-    }
-    None
+        if let Err(error) = result {
+            let hint = if error.kind() == ErrorKind::StorageFull {
+                format!(
+                    " elementary OS needs about {total_mb:.0} MB of free storage. Free up some space and open the app again."
+                )
+            } else {
+                String::new()
+            };
+            let message = format!("Failed to unpack elementary OS: {error}.{hint}");
+            mpsc_sender
+                .send(SetupMessage::Error(message.clone()))
+                .unwrap_or(());
+            panic!("{message}");
+        }
+    }))
 }
 
 fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
+    let fs_root = get_application_context().rootfs_dir;
     let mpsc_sender = options.mpsc_sender.clone();
 
     if !fs_root.join("proc/.version").exists() {
@@ -228,8 +189,31 @@ fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
     None
 }
 
+/// Create the directories bind-mounted into the guest, and the user's home on first launch.
+fn setup_home(options: &SetupOptions) -> StageOutput {
+    let context = get_application_context();
+    fs::create_dir_all(&context.home_dir).expect("Failed to create the home directory");
+    fs::create_dir_all(&context.config_dir).expect("Failed to create the config directory");
+
+    let username = context.local_config.user.username;
+    if username != options.manifest.username {
+        log::warn!(
+            "Configured user {username} is not the one created in the image ({}); make sure it exists",
+            options.manifest.username
+        );
+    }
+    if username != "root" {
+        match rootfs::seed_home(&context.rootfs_dir, &context.home_dir, &username) {
+            Ok(true) => log::info!("Created /home/{username}"),
+            Ok(false) => {}
+            Err(error) => log::error!("Failed to create /home/{username}: {error}"),
+        }
+    }
+    None
+}
+
 fn setup_machine_id(_: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
+    let fs_root = get_application_context().rootfs_dir;
     let machine_id = fs_root.join("etc/machine-id");
 
     let existing = fs::read_to_string(&machine_id).unwrap_or_default();
@@ -282,848 +266,123 @@ fn generate_machine_id() -> String {
     format!("{:016x}{:016x}", nanos as u64, process::id() as u64)
 }
 
-fn install_dependencies(options: &SetupOptions) -> StageOutput {
-    let SetupOptions {
-        mpsc_sender,
-        android_app: _,
-    } = options;
-
+/// Point the guest at Android's DNS servers and the current timezone. Refreshed every launch,
+/// since both change as the phone moves between networks and places.
+fn setup_network_and_time(options: &SetupOptions) -> StageOutput {
     let context = get_application_context();
-    let CommandConfig {
-        check,
-        install,
-        launch: _,
-    } = context.local_config.command;
+    let etc = context.rootfs_dir.join("etc");
 
-    let installed = move || {
-        ArchProcess {
-            command: check.clone(),
-            user: None,
-            log: None,
-        }
-        .run()
-        .status
-        .success()
-    };
-
-    if installed() {
-        return None;
+    let mut nameservers = android_dns_servers(&options.android_app);
+    if nameservers.is_empty() {
+        nameservers = FALLBACK_NAMESERVERS.iter().map(|s| s.to_string()).collect();
     }
+    let resolv_conf: String = nameservers
+        .iter()
+        .map(|server| format!("nameserver {server}\n"))
+        .collect();
+    replace_file(&etc.join("resolv.conf"), &resolv_conf);
+    replace_file(
+        &etc.join("hosts"),
+        "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
+    );
 
-    clear_pipewire_package_lock_for_install();
-
-    let mpsc_sender = mpsc_sender.clone();
-    return Some(thread::spawn(move || {
-        const MAX_INSTALL_ATTEMPTS: usize = 10;
-
-        // Install dependencies until `check` succeeds.
-        for attempt in 1..=MAX_INSTALL_ATTEMPTS {
-            let output = ArchProcess {
-                command: "rm -f /var/lib/pacman/db.lck".into(),
-                user: None,
-                log: None,
-            }
-            .run();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let sender = mpsc_sender.clone();
-            ArchProcess {
-                command: install.clone(),
-                user: None,
-                log: Some(Arc::new(move |it| {
-                    sender
-                        .send(SetupMessage::Progress(it))
-                        .expect("Failed to send log message");
-                })),
-            }
-            .run();
-
-            if installed() {
-                download_user_manual();
-                return;
-            }
-            mpsc_sender
-                .send(SetupMessage::Progress(format!(
-                    "Retrying installation... (attempt {}/{})",
-                    attempt, MAX_INSTALL_ATTEMPTS
-                )))
-                .expect("Failed to send dependency install progress");
-
-            if attempt == MAX_INSTALL_ATTEMPTS {
-                let error_message = format!(
-                    "Failed to install desktop dependencies after {} attempts. Please check your net connection and try restarting the app.",
-                    MAX_INSTALL_ATTEMPTS
-                );
-                mpsc_sender
-                    .send(SetupMessage::Error(error_message.clone()))
-                    .unwrap_or(());
-                panic!("{}", error_message);
-            }
-        }
-    }));
-}
-
-/// Drop the offline User Manual for this app version onto the guest desktop.
-///
-/// The filename carries no version so an update overwrites the previous copy instead of landing
-/// beside it. Called once a fresh install or update has just succeeded — the only moment the
-/// manual on disk can be out of date — and best-effort: a failed download is not worth a retry.
-fn download_user_manual() {
-    let username = get_application_context().local_config.user.username;
-    let desktop_dir = chroot_home_dir(Path::new(ARCH_FS_ROOT), &username).join("Desktop");
-    if fs::create_dir_all(&desktop_dir).is_err() {
-        return;
-    }
-
-    let url = crate::core::config::user_manual_url();
-    let response = reqwest::blocking::get(&url).and_then(|it| it.error_for_status());
-    if let Ok(bytes) = response.and_then(|it| it.bytes()) {
-        let _ = fs::write(desktop_dir.join("Local Desktop - User Manual.pdf"), &bytes);
-    }
-}
-
-fn clear_pipewire_package_lock_for_install() {
-    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
-    let content = match fs::read_to_string(&pacman_conf) {
-        Ok(content) => content,
-        Err(error) => {
-            log::warn!(
-                "Skipping PipeWire pacman unlock before install; failed to read {}: {error}",
-                pacman_conf.display()
-            );
-            return;
-        }
-    };
-
-    let updated = remove_pacman_ignore_pkg(&content, PIPEWIRE_GUEST_LOCK_PACKAGES);
-    if updated != content {
-        fs::write(&pacman_conf, updated)
-            .expect("Failed to clear PipeWire pacman lock before install");
-        log::info!("Temporarily cleared guest PipeWire package lock before dependency install");
-    }
-}
-
-fn setup_pipewire_package_lock(_: &SetupOptions) -> StageOutput {
-    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
-    let content = match fs::read_to_string(&pacman_conf) {
-        Ok(content) => content,
-        Err(error) => {
-            log::warn!(
-                "Skipping PipeWire pacman lock; failed to read {}: {error}",
-                pacman_conf.display()
-            );
-            return None;
-        }
-    };
-
-    let updated = ensure_pacman_ignore_pkg(&content, PIPEWIRE_GUEST_LOCK_PACKAGES);
-    if updated != content {
-        fs::write(&pacman_conf, updated).expect("Failed to write PipeWire pacman lock");
-        log::info!(
-            "Locked guest PipeWire packages in {}: {}",
-            pacman_conf.display(),
-            PIPEWIRE_GUEST_LOCK_PACKAGES.join(" ")
-        );
-    }
-
-    None
-}
-
-fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
-    // Create the Firefox root directory if it doesn't exist
-    let firefox_root = format!("{}/usr/lib/firefox", ARCH_FS_ROOT);
-    let _ = fs::create_dir_all(&firefox_root).expect("Failed to create Firefox root directory");
-
-    // Create the defaults/pref directory
-    let pref_dir = format!("{}/defaults/pref", firefox_root);
-    let _ = fs::create_dir_all(&pref_dir).expect("Failed to create Firefox pref directory");
-
-    // Create autoconfig.js in defaults/pref
-    let autoconfig_js = r#"pref("general.config.filename", "localdesktop.cfg");
-pref("general.config.obscure_value", 0);
-pref("general.config.sandbox_enabled", false);
-"#;
-
-    let _ = fs::write(format!("{}/autoconfig.js", pref_dir), autoconfig_js)
-        .expect("Failed to write Firefox autoconfig.js");
-
-    // Create localdesktop.cfg in the Firefox root directory
-    let firefox_cfg = r#"// Auto updated by Local Desktop on each startup, do not edit manually
-defaultPref("media.cubeb.sandbox", false);
-defaultPref("security.sandbox.content.level", 0);
-defaultPref("media.allow-audio-non-utility", true);
-defaultPref("media.rdd-process.enabled", false);
-
-try {
-  var { SandboxUtils } = ChromeUtils.importESModule("resource://gre/modules/SandboxUtils.sys.mjs");
-  SandboxUtils.maybeWarnAboutDisabledContentSandbox = () => {};
-  SandboxUtils.observeContentSandboxPref = () => {};
-} catch (_) {}
-"#; // It is required that the first line of this file is a comment, even if you have nothing to comment. Docs: https://support.mozilla.org/en-US/kb/customizing-firefox-using-autoconfig
-
-    let _ = fs::write(format!("{}/localdesktop.cfg", firefox_root), firefox_cfg)
-        .expect("Failed to write Firefox configuration");
-
-    None
-}
-
-#[derive(Debug)]
-enum KvLine {
-    Entry {
-        key: String,
-        value: String,
-        prefix: String,
-        delimiter: char,
-    },
-    Other(String),
-}
-
-fn parse_kv_lines(content: &str, delimiter: char) -> Vec<KvLine> {
-    content
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-                return KvLine::Other(line.to_string());
-            }
-            if let Some((left, right)) = line.split_once(delimiter) {
-                let key = left.trim().to_string();
-                if key.is_empty() {
-                    return KvLine::Other(line.to_string());
-                }
-                let prefix_len = line.len() - trimmed.len();
-                let prefix = line[..prefix_len].to_string();
-                let value = right.trim().to_string();
-                KvLine::Entry {
-                    key,
-                    value,
-                    prefix,
-                    delimiter,
-                }
-            } else {
-                KvLine::Other(line.to_string())
-            }
-        })
-        .collect()
-}
-
-fn set_kv_value(lines: &mut Vec<KvLine>, key: &str, value: &str, delimiter: char) {
-    let mut updated = false;
-    for line in lines.iter_mut() {
-        if let KvLine::Entry {
-            key: entry_key,
-            value: entry_value,
-            ..
-        } = line
+    if let Some(timezone) = &context.timezone {
+        if context
+            .rootfs_dir
+            .join("usr/share/zoneinfo")
+            .join(timezone)
+            .is_file()
         {
-            if entry_key == key {
-                *entry_value = value.to_string();
-                updated = true;
+            replace_file(&etc.join("timezone"), &format!("{timezone}\n"));
+            let localtime = etc.join("localtime");
+            let _ = fs::remove_file(&localtime);
+            // Relative, so the link also resolves when read from outside proot.
+            let _ = symlink(format!("../usr/share/zoneinfo/{timezone}"), &localtime);
+        }
+    }
+    None
+}
+
+/// Write `contents` to `path`, replacing a symlink or read-only file left there by the image.
+fn replace_file(path: &Path, contents: &str) {
+    let _ = fs::remove_file(path);
+    if let Err(error) = fs::write(path, contents) {
+        log::warn!("Failed to write {}: {error}", path.display());
+    }
+}
+
+/// The DNS servers of Android's active network, as IP address strings.
+fn android_dns_servers(android_app: &AndroidApp) -> Vec<String> {
+    fn query(env: &mut jni::JNIEnv, app: &AndroidApp) -> Option<Vec<String>> {
+            let activity =
+                unsafe { JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::_jobject) };
+            let service = env.new_string("connectivity").ok()?;
+            let manager = env
+                .call_method(
+                    activity,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[(&service).into()],
+                )
+                .and_then(|it| it.l())
+                .ok()?;
+            let network = env
+                .call_method(&manager, "getActiveNetwork", "()Landroid/net/Network;", &[])
+                .and_then(|it| it.l())
+                .ok()
+                .filter(|it| !it.is_null())?;
+            let properties = env
+                .call_method(
+                    &manager,
+                    "getLinkProperties",
+                    "(Landroid/net/Network;)Landroid/net/LinkProperties;",
+                    &[(&network).into()],
+                )
+                .and_then(|it| it.l())
+                .ok()
+                .filter(|it| !it.is_null())?;
+            let servers = env
+                .call_method(properties, "getDnsServers", "()Ljava/util/List;", &[])
+                .and_then(|it| it.l())
+                .ok()?;
+            let count = env
+                .call_method(&servers, "size", "()I", &[])
+                .and_then(|it| it.i())
+                .ok()?;
+
+            let mut result = Vec::new();
+            for i in 0..count {
+                let address = env
+                    .call_method(&servers, "get", "(I)Ljava/lang/Object;", &[i.into()])
+                    .and_then(|it| it.l())
+                    .ok()?;
+                let host = env
+                    .call_method(address, "getHostAddress", "()Ljava/lang/String;", &[])
+                    .and_then(|it| it.l())
+                    .ok()?;
+                let host: String = env.get_string(&JString::from(host)).ok()?.into();
+                // glibc does not understand scoped IPv6 addresses such as fe80::1%wlan0.
+                if !host.contains('%') {
+                    result.push(host);
+                }
             }
-        }
-    }
-    if !updated {
-        lines.push(KvLine::Entry {
-            key: key.to_string(),
-            value: value.to_string(),
-            prefix: String::new(),
-            delimiter,
-        });
-    }
-}
-
-fn render_kv_lines(lines: &[KvLine]) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for line in lines {
-        match line {
-            KvLine::Entry {
-                key,
-                value,
-                prefix,
-                delimiter,
-            } => out.push(format!("{}{}{} {}", prefix, key, delimiter, value)),
-            KvLine::Other(raw) => out.push(raw.to_string()),
-        }
-    }
-    let mut content = out.join("\n");
-    content.push('\n');
-    content
-}
-
-fn upsert_kv_file(path: &Path, delimiter: char, updates: &[(&str, String)]) {
-    let content = fs::read_to_string(path).unwrap_or_default();
-    let mut lines = parse_kv_lines(&content, delimiter);
-    for (key, value) in updates {
-        set_kv_value(&mut lines, key, value, delimiter);
-    }
-    let content = render_kv_lines(&lines);
-    fs::write(path, content).expect("Failed to write key/value file");
-}
-
-fn ensure_pacman_ignore_pkg(content: &str, packages: &[&str]) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let value = packages.join(" ");
-
-    let Some(options_start) = lines.iter().position(|line| line.trim() == "[options]") else {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push("[options]".to_string());
-        lines.push(format!("IgnorePkg   = {value}"));
-        let mut out = lines.join("\n");
-        out.push('\n');
-        return out;
-    };
-
-    let options_end = lines
-        .iter()
-        .enumerate()
-        .skip(options_start + 1)
-        .find(|(_, line)| {
-            let trimmed = line.trim();
-            trimmed.starts_with('[') && trimmed.ends_with(']')
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(lines.len());
-
-    let mut insert_after_comment = None;
-    for index in options_start + 1..options_end {
-        let trimmed = lines[index].trim_start();
-        let active = !trimmed.starts_with('#');
-        let candidate = if active {
-            trimmed
-        } else {
-            trimmed.trim_start_matches('#').trim_start()
-        };
-
-        let Some((key, existing)) = candidate.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "IgnorePkg" {
-            continue;
-        }
-
-        if active {
-            let merged = merge_pacman_list(existing, packages);
-            lines[index] = format!("IgnorePkg   = {merged}");
-            let mut out = lines.join("\n");
-            out.push('\n');
-            return out;
-        }
-
-        insert_after_comment = Some(index + 1);
+            Some(result)
     }
 
-    lines.insert(
-        insert_after_comment.unwrap_or(options_start + 1),
-        format!("IgnorePkg   = {value}"),
-    );
-
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
-}
-
-fn merge_pacman_list(existing: &str, packages: &[&str]) -> String {
-    let mut values: Vec<String> = existing.split_whitespace().map(str::to_string).collect();
-    for package in packages {
-        if !values.iter().any(|value| value == package) {
-            values.push((*package).to_string());
-        }
-    }
-    values.join(" ")
-}
-
-fn remove_pacman_ignore_pkg(content: &str, packages: &[&str]) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-
-    let Some(options_start) = lines.iter().position(|line| line.trim() == "[options]") else {
-        let mut out = lines.join("\n");
-        out.push('\n');
-        return out;
-    };
-
-    let options_end = lines
-        .iter()
-        .enumerate()
-        .skip(options_start + 1)
-        .find(|(_, line)| {
-            let trimmed = line.trim();
-            trimmed.starts_with('[') && trimmed.ends_with(']')
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(lines.len());
-
-    for line in lines.iter_mut().take(options_end).skip(options_start + 1) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-
-        let Some((key, existing)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "IgnorePkg" {
-            continue;
-        }
-
-        let remaining = existing
-            .split_whitespace()
-            .filter(|value| !packages.iter().any(|package| package == value))
-            .collect::<Vec<_>>()
-            .join(" ");
-        *line = if remaining.is_empty() {
-            "IgnorePkg   =".to_string()
-        } else {
-            format!("IgnorePkg   = {remaining}")
-        };
-    }
-
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
-}
-
-fn setup_fake_bwrap(_: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let wrapper_path = fs_root.join("usr/local/bin/bwrap");
-
-    // bwrap (Bubblewrap) requires Linux user namespaces (CLONE_NEWUSER) which are
-    // blocked by Android SELinux. We replace it with a shim that strips all
-    // namespace/sandbox flags and directly exec's the target binary.
-    // This unblocks glycin-svg (used by Onboard) which sandbox-loads SVG files via bwrap.
-    let wrapper = r#"#!/bin/sh
-# bwrap shim for proot/Android: namespaces are unavailable, exec directly.
-# Strips all bwrap sandbox/namespace/bind flags, then exec's the target binary.
-while [ $# -gt 0 ]; do
-    case "$1" in
-        # Three-argument flags (flag + src/key + dest/value)
-        --ro-bind|--bind|--dev-bind|--bind-try|--ro-bind-try|--dev-bind-try|\
-        --file|--bind-data|--ro-bind-data|--symlink|\
-        --setenv|--chmod) shift 3 ;;
-        # Two-argument flags (flag + single arg)
-        --tmpfs|--proc|--dir|\
-        --unsetenv|--perms|--cap-add|--cap-drop|\
-        --seccomp|--add-seccomp-fd|--info-fd|--json-status-fd|\
-        --block-fd|--userns-block-fd|--userns|--userns2|\
-        --pidns|--chdir|--dev|--mqueue) shift 2 ;;
-        # Zero-argument flags
-        --unshare-all|--unshare-user|--unshare-user-try|--unshare-pid|\
-        --unshare-ipc|--unshare-net|--unshare-uts|--unshare-cgroup|\
-        --unshare-cgroup-try|--share-net|--remount-ro|\
-        --as-pid-1|--die-with-parent|--new-session|--clearenv) shift ;;
-        --) shift; break ;;
-        *) break ;;
-    esac
-done
-exec "$@"
-"#;
-
-    let _ = fs::create_dir_all(
-        wrapper_path
-            .parent()
-            .expect("Failed to read bwrap wrapper parent directory"),
-    );
-    fs::write(&wrapper_path, wrapper).expect("Failed to write bwrap wrapper");
-    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to mark bwrap wrapper executable");
-
-    None
-}
-
-fn setup_chromium_no_sandbox(_: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-
-    // Chromium's sandbox needs CLONE_NEWUSER, which Android SELinux blocks, so every
-    // Chromium/Electron app has to be started with --no-sandbox. Electron apps pick that up
-    // from ELECTRON_DISABLE_SANDBOX (exported by startxfce4-localdesktop), but Chromium itself
-    // only takes the flag, and its desktop entry hardcodes an absolute path that a
-    // /usr/local/bin wrapper cannot intercept. So shadow the affected application entries in
-    // the user's own XDG directory, re-running every session to catch newly installed apps.
-    write_executable(
-        &fs_root.join("usr/local/bin/localdesktop-no-sandbox-entries"),
-        r#"#!/bin/sh
-target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-mkdir -p "$target_dir" || exit 0
-
-for src in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
-    [ -f "$src" ] || continue
-
-    prog=$(sed -n 's/^Exec=//p' "$src" | head -n1 | awk '{print $1}')
-    [ -n "$prog" ] || continue
-    case "$prog" in
-        /*) bin="$prog" ;;
-        *) bin=$(command -v "$prog" 2>/dev/null) || continue ;;
-    esac
-    bin=$(readlink -f "$bin" 2>/dev/null)
-    [ -n "$bin" ] || continue
-
-    # Every Chromium/Electron build ships the setuid sandbox helper next to its binary,
-    # or one level up when the launcher lives in a bin/ subdirectory.
-    dir=$(dirname "$bin")
-    [ -e "$dir/chrome-sandbox" ] || [ -e "$dir/../chrome-sandbox" ] || continue
-
-    dst="$target_dir/$(basename "$src")"
-    # Leave alone anything the user wrote themselves.
-    if [ -e "$dst" ] && ! grep -q '^X-LocalDesktop-NoSandbox=' "$dst"; then
-        continue
-    fi
-
-    awk '
-        /^\[Desktop Entry\]/ && !seen { print; print "X-LocalDesktop-NoSandbox=true"; seen = 1; next }
-        /^Exec=/ && !/--no-sandbox/ { sub(/^Exec=[^ ]+/, "& --no-sandbox") }
-        { print }
-    ' "$src" > "$dst"
-done
-"#,
-    );
-
-    // Same flag for terminal launches, following the /usr/local/bin PATH-priority pattern.
-    write_executable(
-        &fs_root.join("usr/local/bin/chromium"),
-        r#"#!/bin/sh
-[ -x /usr/bin/chromium ] || { echo "chromium is not installed" >&2; exit 127; }
-exec /usr/bin/chromium --no-sandbox "$@"
-"#,
-    );
-
-    None
-}
-
-fn setup_onboard_signal_fix(_: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let wrapper_path = fs_root.join("usr/local/bin/onboard");
-
-    // proot intercepts fstat() on socket fds and follows /proc/self/fd/N which points
-    // to "socket:[inode]" — not a real path. Python 3.14's signal.set_wakeup_fd()
-    // calls fstat(fd) to validate the wakeup socket, which fails with ENOENT under proot.
-    // We install a wrapper at /usr/local/bin/onboard (higher PATH priority than /usr/sbin)
-    // that monkey-patches signal.set_wakeup_fd to swallow OSError before launching the
-    // real Onboard binary.
-    let wrapper = r#"#!/usr/bin/python3
-# Onboard wrapper for proot/Android: patches signal.set_wakeup_fd to handle
-# OSError (ENOENT) caused by proot's fstat translation on socket file descriptors.
-import signal as _signal
-_orig_swf = _signal.set_wakeup_fd
-def _safe_swf(fd, **kwargs):
-    try:
-        return _orig_swf(fd, **kwargs)
-    except OSError:
-        return -1
-_signal.set_wakeup_fd = _safe_swf
-
-import runpy, sys
-sys.argv[0] = '/usr/sbin/onboard'
-runpy.run_path('/usr/sbin/onboard', run_name='__main__')
-"#;
-
-    let _ = fs::create_dir_all(
-        wrapper_path
-            .parent()
-            .expect("Failed to read onboard wrapper parent directory"),
-    );
-    fs::write(&wrapper_path, wrapper).expect("Failed to write onboard wrapper");
-    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to mark onboard wrapper executable");
-
-    None
-}
-
-fn chroot_home_dir(fs_root: &Path, username: &str) -> PathBuf {
-    if username == "root" {
-        fs_root.join("root")
-    } else {
-        fs_root.join(format!("home/{username}"))
-    }
-}
-
-fn write_executable(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(path, contents).expect("Failed to write executable script");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to mark executable script");
-}
-
-/// Map Android density to a whole-number UI scale factor (same baseline as the old LXQt setup).
-fn android_ui_scale(density_dpi: i32) -> i32 {
-    ((density_dpi as f32) / 160.0 * 1.1).max(1.0).round() as i32
-}
-
-fn setup_xfce_wayland(options: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let username = get_application_context().local_config.user.username;
-    let home_dir = chroot_home_dir(fs_root, &username);
-    let labwc_dir = home_dir.join(".config/xfce4/labwc");
-
-    let ui_scale = android_ui_scale(density_dpi(&options.android_app));
-    // Xft uses 96 as the default logical DPI; multiply by scale for HiDPI fonts.
-    let xft_dpi = ui_scale * 96;
-
-    // Still useful for Xwayland clients started by labwc.
-    let xresources_path = home_dir.join(".Xresources");
-    let _ = fs::create_dir_all(
-        xresources_path
-            .parent()
-            .expect("Failed to read Xresources parent directory"),
-    );
-    upsert_kv_file(&xresources_path, ':', &[("Xft.dpi", xft_dpi.to_string())]);
-
-    // xfconf is read when xfce4-session starts; agent toggles must exist before launch
-    // (https://docs.xfce.org/xfce/xfce4-session/advanced — SSH and GPG Agents).
-    let xfconf_dir = home_dir.join(".config/xfce4/xfconf/xfce-perchannel-xml");
-    let _ = fs::create_dir_all(&xfconf_dir);
-    fs::write(
-        xfconf_dir.join("xfce4-session.xml"),
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-
-<channel name="xfce4-session" version="1.0">
-  <property name="startup" type="empty">
-    <property name="ssh-agent" type="empty">
-      <property name="enabled" type="bool" value="false"/>
-    </property>
-    <property name="gpg-agent" type="empty">
-      <property name="enabled" type="bool" value="false"/>
-    </property>
-  </property>
-</channel>
-"#,
+    run_in_jvm(
+        |env, app| {
+            query(env, app).unwrap_or_else(|| {
+                // A call that threw leaves the exception pending; later JNI calls would fail.
+                let _ = env.exception_clear();
+                Vec::new()
+            })
+        },
+        android_app.clone(),
     )
-    .expect("Failed to write xfce4-session xfconf defaults");
-    fs::write(
-        xfconf_dir.join("xsettings.xml"),
-        &format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-
-<channel name="xsettings" version="1.0">
-  <property name="Xft" type="empty">
-    <property name="DPI" type="int" value="{xft_dpi}"/>
-  </property>
-</channel>
-"#
-        ),
-    )
-    .expect("Failed to write xsettings xfconf defaults");
-
-    // https://docs.xfce.org/xfce/getting-started — `startxfce4 --wayland` starts the
-    // session manager, panel, compositor (labwc), and desktop manager.
-    write_executable(
-        &fs_root.join("usr/local/bin/startxfce4-localdesktop"),
-        &format!(
-            r#"#!/bin/sh
-export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR}
-export PULSE_SERVER={PULSE_GUEST_SERVER}
-: "${{XDG_RUNTIME_DIR:={PIPEWIRE_GUEST_RUNTIME_DIR}}}"
-export XDG_RUNTIME_DIR
-# Electron adds --no-sandbox when this is set; Android has no user namespaces for it to use.
-export ELECTRON_DISABLE_SANDBOX=1
-exec startxfce4 --wayland "$@"
-"#
-        ),
-    );
-
-    // Runs from ~/.config/autostart once xfsettingsd is up; reinforces pre-seeded /Xft/DPI and
-    // refreshes the --no-sandbox application entries for anything installed since last session.
-    write_executable(
-        &fs_root.join("usr/local/bin/localdesktop-xfce-session-init"),
-        &format!(
-            r#"#!/bin/sh
-for _ in $(seq 1 50); do
-    xfconf-query -c xsettings -lv >/dev/null 2>&1 && break
-    sleep 0.1
-done
-
-xfconf-query -c xsettings -p /Xft/DPI -n -t int -s {xft_dpi} 2>/dev/null || \
-xfconf-query -c xsettings -p /Xft/DPI -t int -s {xft_dpi}
-
-/usr/local/bin/localdesktop-no-sandbox-entries
-"#
-        ),
-    );
-
-    let desktop_dir = home_dir.join("Desktop");
-    let _ = fs::create_dir_all(&desktop_dir);
-
-    // Desktop items are seeded create-if-missing (the run-once mechanism described
-    // on `StageOutput`): write only when absent, so we never clobber the user's
-    // edits or re-create on every launch. Deleting an item re-seeds it next launch,
-    // same as the rest of the managed environment.
-    let online_docs = desktop_dir.join("localdesktop-online-docs.desktop");
-    if !online_docs.exists() {
-        let _ = fs::write(
-            &online_docs,
-            format!(
-                r#"[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Local Desktop - Online Docs
-Comment=Open the Local Desktop documentation website
-Exec=firefox {DOCS_HOME_URL}
-Icon=firefox
-Terminal=false
-StartupNotify=true
-"#
-            ),
-        );
-    }
-    // Remove the launcher's former name so existing installs pick up the rename.
-    let _ = fs::remove_file(desktop_dir.join("localdesktop-documentation.desktop"));
-
-    // Open PDFs (e.g. the manual below) in Evince instead of Firefox. Create-if-missing
-    // so we don't stomp a user's own default-app choices.
-    let mimeapps = home_dir.join(".config/mimeapps.list");
-    if !mimeapps.exists() {
-        let _ = fs::write(
-            &mimeapps,
-            "[Default Applications]\napplication/pdf=org.gnome.Evince.desktop\n",
-        );
-    }
-
-    let autostart_dir = home_dir.join(".config/autostart");
-    let _ = fs::create_dir_all(&autostart_dir);
-
-    fs::write(
-        autostart_dir.join("localdesktop-xfce-session-init.desktop"),
-        r#"[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Local Desktop Xfce Session Init
-Comment=Apply HiDPI font scaling and refresh sandbox-free application entries
-Exec=/usr/local/bin/localdesktop-xfce-session-init
-Terminal=false
-OnlyShowIn=XFCE;
-X-GNOME-Autostart-enabled=true
-"#,
-    )
-    .expect("Failed to write Xfce session init autostart entry");
-
-    // xfce4-power-manager expects host power interfaces that proot cannot provide.
-    fs::write(
-        autostart_dir.join("xfce4-power-manager.desktop"),
-        r#"[Desktop Entry]
-Type=Application
-Name=Power Manager
-Hidden=true
-OnlyShowIn=XFCE;
-"#,
-    )
-    .expect("Failed to disable xfce4-power-manager autostart");
-
-    let _ = fs::remove_file(autostart_dir.join("localdesktop-xfce-scale.desktop"));
-    let _ = fs::remove_file(autostart_dir.join("localdesktop-wlroots-output.desktop"));
-    let _ = fs::remove_file(fs_root.join("usr/local/bin/localdesktop-xfce-scale"));
-
-    // labwc runs wlr-randr from its autostart script once the compositor owns the output
-    // (labwc-config.5). Xfce stores labwc config under ~/.config/xfce4/labwc/.
-    //
-    // Host geometry is written to /tmp/localdesktop-output by the Android compositor before
-    // launch; the script waits for that file instead of applying a hardcoded fallback mode.
-    write_executable(
-        &fs_root.join("usr/local/bin/localdesktop-wlroots-output"),
-        &format!(
-            r#"#!/bin/sh
-# Keep labwc's wlroots output aligned with the Android host window.
-state_file="/tmp/localdesktop-output"
-lock_file="/tmp/localdesktop-wlroots-output.pid"
-fallback_scale="{ui_scale}"
-
-if [ -r "$lock_file" ]; then
-    old_pid=$(cat "$lock_file" 2>/dev/null)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-        exit 0
-    fi
-fi
-echo "$$" > "$lock_file"
-trap 'rm -f "$lock_file"' EXIT INT TERM
-
-first_output() {{
-    wlr-randr 2>/dev/null | awk 'NF > 0 && $1 !~ /^Modes:/ && $1 !~ /^Current:/ && $1 !~ /^Position:/ && $1 !~ /^Transform:/ && $1 !~ /^Scale:/ {{ print $1; exit }}'
-}}
-
-read_output_state() {{
-    target_mode=""
-    target_scale="$fallback_scale"
-    if [ -r "$state_file" ]; then
-        . "$state_file"
-        target_mode="${{LOCALDESKTOP_OUTPUT_MODE:-}}"
-        target_scale="${{LOCALDESKTOP_OUTPUT_SCALE:-$target_scale}}"
-    fi
-    case "$target_mode" in
-        *x*) ;;
-        *) return 1 ;;
-    esac
-    case "$target_scale" in
-        ''|*[!0-9]*) target_scale="$fallback_scale" ;;
-    esac
-}}
-
-apply_output() {{
-    output="$1"
-    wlr-randr --output "$output" --custom-mode "${{target_mode}}@60Hz" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --custom-mode "$target_mode" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --mode "$target_mode" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    return 1
-}}
-
-last_config=""
-while true; do
-    if ! read_output_state; then
-        sleep 0.2
-        continue
-    fi
-    output=$(first_output)
-    if [ -n "$output" ]; then
-        config="$output $target_mode $target_scale"
-        if [ "$config" != "$last_config" ] && apply_output "$output"; then
-            last_config="$config"
-        fi
-    fi
-    sleep 1
-done
-"#
-        ),
-    );
-
-    let _ = fs::create_dir_all(&labwc_dir);
-    // Nested on our compositor: reuse the parent wl_output mode when possible (labwc-config.5).
-    fs::write(
-        labwc_dir.join("rc.xml"),
-        r#"<?xml version="1.0"?>
-<labwc_config>
-  <core>
-    <reuseOutputMode>yes</reuseOutputMode>
-  </core>
-</labwc_config>
-"#,
-    )
-    .expect("Failed to write labwc rc.xml defaults");
-    write_executable(
-        &labwc_dir.join("autostart"),
-        r#"#!/bin/sh
-/usr/local/bin/localdesktop-wlroots-output >/tmp/localdesktop-wlroots-output.log 2>&1 &
-"#,
-    );
-
-    // Arch wiki: lock prevents startxfce4 from overwriting custom labwc environment.
-    // https://wiki.archlinux.org/title/Xfce#Using_labwc_custom_keymaps
-    fs::write(
-        labwc_dir.join("environment"),
-        "XDG_SESSION_TYPE=wayland\nXDG_CURRENT_DESKTOP=XFCE\n",
-    )
-    .expect("Failed to write labwc environment file");
-    fs::write(labwc_dir.join("lock"), "").expect("Failed to write labwc environment lock file");
-
-    let _ = fs::remove_file(home_dir.join(".config/labwc/autostart"));
-
-    None
 }
+
 fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
+    let fs_root = get_application_context().rootfs_dir;
     let xkb_path = fs_root.join("usr/share/X11/xkb");
     let mpsc_sender = options.mpsc_sender.clone();
 
@@ -1132,24 +391,19 @@ fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
             if let Ok(target) = fs::read_link(&xkb_path) {
                 if target.is_absolute() {
                     log::info!(
-                        "Absolute symlink target detected: {} -> {}. This is a problem because libxkbcommon is loaded in NDK, whose / is not Arch FS root!",
+                        "Absolute symlink target detected: {} -> {}. This is a problem because libxkbcommon is loaded in NDK, whose / is not the guest root!",
                         xkb_path.display(),
                         target.display()
                     );
-                    // Compute the relative path from /usr/share/X11/xkb to /usr/share/xkeyboard-config-2
-                    // Both are inside the chroot, so strip the fs_root prefix
                     let xkb_inside = Path::new("/usr/share/X11/xkb");
-                    let target_inside = Path::new("/usr/share/xkeyboard-config-2");
-                    let rel_target = diff_paths(target_inside, xkb_inside.parent().unwrap())
-                        .unwrap_or_else(|| target_inside.to_path_buf());
+                    let rel_target = diff_paths(&target, xkb_inside.parent().unwrap())
+                        .unwrap_or_else(|| target.to_path_buf());
                     log::info!(
                         "Fixing with new relative symlink: {} -> {}",
                         xkb_path.display(),
                         rel_target.display()
                     );
-                    // Remove the old symlink
                     let _ = fs::remove_file(&xkb_path);
-                    // Create the new relative symlink
                     if let Err(e) = symlink(&rel_target, &xkb_path) {
                         mpsc_sender
                             .send(SetupMessage::Error(format!(
@@ -1165,11 +419,30 @@ fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
     None
 }
 
+pub fn build_wayland_backend(android_app: AndroidApp) -> WaylandBackend {
+    WaylandBackend {
+        compositor: Compositor::build().expect("Failed to build compositor"),
+        graphic_renderer: None,
+        clock: Clock::new(),
+        key_counter: 0,
+        guest_scale_factor: scale_factor(&android_app),
+        touch_points: std::collections::HashMap::new(),
+        scroll_centroid: None,
+        touch_mode: TouchMode::Undecided,
+        touch_down_position: None,
+        touch_down_time: None,
+        touch_slop_px: touch_slop_px(&android_app),
+        long_press_timeout_ms: long_press_timeout_ms(&android_app),
+        pointer_pressed: false,
+        android_app,
+    }
+}
+
 pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
     let (sender, receiver) = mpsc::channel();
     let progress = Arc::new(Mutex::new(0));
 
-    if ArchProcess::is_supported(&android_app) {
+    if GuestProcess::is_supported(&android_app) {
         sender
             .send(SetupMessage::Progress(
                 "✅ Your device is supported!".to_string(),
@@ -1184,23 +457,34 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
         });
     }
 
+    let Some(manifest) = read_manifest(&android_app) else {
+        log::error!(
+            "{ROOTFS_MANIFEST} is missing from the APK; build it with scripts/build-rootfs.sh"
+        );
+        return PolarBearBackend::WebView(WebviewBackend {
+            socket_port: 0,
+            progress,
+            error: ErrorVariant::MissingOs,
+        });
+    };
+
+    if let Err(error) = rootfs::remove_partial(&get_application_context().rootfs_dir) {
+        log::warn!("Failed to clean up an interrupted install: {error}");
+    }
+
     let options = SetupOptions {
         android_app: android_app.clone(),
         mpsc_sender: sender.clone(),
+        manifest,
     };
 
     let stages: Vec<SetupStage> = vec![
-        Box::new(setup_arch_fs),                // Step 1. Setup Arch FS (extract)
+        Box::new(setup_rootfs),                 // Step 1. Unpack the OS bundled in the APK
         Box::new(simulate_linux_sysdata_stage), // Step 2. Simulate Linux system data
-        Box::new(install_dependencies),         // Step 3. Install dependencies
+        Box::new(setup_home),                   // Step 3. Persistent /home and /etc/localdesktop
         Box::new(setup_machine_id),             // Step 4. Seed /etc/machine-id for D-Bus clients
-        Box::new(setup_pipewire_package_lock), // Step 5. Hold guest PipeWire packages for the Android-side PipeWire POC
-        Box::new(setup_firefox_config),        // Step 6. Setup Firefox config
-        Box::new(setup_fake_bwrap), // Step 7. Replace bwrap with a no-sandbox shim (Android has no user namespaces)
-        Box::new(setup_chromium_no_sandbox), // Step 8. Make Chromium/Electron apps launchable without a terminal
-        Box::new(setup_onboard_signal_fix), // Step 9. Wrap Onboard to survive proot fstat/signal.set_wakeup_fd failure
-        Box::new(setup_xfce_wayland),       // Step 10. Setup Xfce Wayland launch and HiDPI scaling
-        Box::new(fix_xkb_symlink),          // Step 11. Fix xkb symlink
+        Box::new(setup_network_and_time),       // Step 5. DNS servers and timezone from Android
+        Box::new(fix_xkb_symlink),              // Step 6. Fix xkb symlink
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {
@@ -1249,14 +533,15 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
                         }
                     }
 
-                    // All stages are done, we need to replace the WebviewBackend with the WaylandBackend
-                    // Or, easier, just restart the whole app
+                    // Everything is in place: go straight to the desktop instead of asking the
+                    // user to restart the app.
                     *progress.lock().unwrap() = 100;
                     sender_clone
                         .send(SetupMessage::Progress(
-                            "Installation finished, please restart the app".to_string(),
+                            "Starting elementary OS...".to_string(),
                         ))
-                        .expect("Failed to send installation finished message");
+                        .unwrap_or(());
+                    send_user_event(AppUserEvent::SetupFinished);
                 });
 
                 // Setup is still running in the background, but we need to return control
@@ -1270,22 +555,7 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
     };
 
     if fully_installed {
-        PolarBearBackend::Wayland(WaylandBackend {
-            compositor: Compositor::build().expect("Failed to build compositor"),
-            graphic_renderer: None,
-            clock: Clock::new(),
-            key_counter: 0,
-            guest_scale_factor: scale_factor(&android_app),
-            touch_points: std::collections::HashMap::new(),
-            scroll_centroid: None,
-            touch_mode: TouchMode::Undecided,
-            touch_down_position: None,
-            touch_down_time: None,
-            touch_slop_px: touch_slop_px(&android_app),
-            long_press_timeout_ms: long_press_timeout_ms(&android_app),
-            pointer_pressed: false,
-            android_app,
-        })
+        PolarBearBackend::Wayland(build_wayland_backend(android_app))
     } else {
         PolarBearBackend::WebView(WebviewBackend::build(receiver, progress))
     }

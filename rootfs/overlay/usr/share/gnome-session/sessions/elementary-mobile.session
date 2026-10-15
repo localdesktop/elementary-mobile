@@ -1,0 +1,9 @@
+[GNOME Session]
+Name=elementary OS
+# Only the settings daemons the desktop needs, and that register with gnome-session over D-Bus.
+# Android kills apps with more than 32 child processes (its "phantom process" limit), so every
+# daemon left out here is room for an open app. Gala is deliberately not listed: it reports
+# readiness to systemd only, so gnome-session would time out waiting for it and show the failure
+# screen. elementary-mobile-session starts it instead.
+RequiredComponents=pantheon-org.gnome.SettingsDaemon.Keyboard;pantheon-org.gnome.SettingsDaemon.XSettings
+DesktopName=Pantheon

@@ -1,6 +1,6 @@
 use crate::{
     android::utils::ndk::run_in_jvm,
-    core::config::{parse_config, LocalConfig, ARCH_FS_ROOT, CONFIG_FILE},
+    core::config::{parse_config, LocalConfig, CONFIG_DIR, CONFIG_FILE, HOME_DIR, ROOTFS_DIR},
 };
 use jni::{
     objects::{JObject, JString},
@@ -14,9 +14,17 @@ use winit::platform::android::activity::AndroidApp;
 pub struct ApplicationContext {
     pub cache_dir: PathBuf,
     pub data_dir: PathBuf,
+    /// The unpacked OS, the guest's `/`.
+    pub rootfs_dir: PathBuf,
+    /// The guest's `/home`, kept outside `rootfs_dir` so OS updates do not touch it.
+    pub home_dir: PathBuf,
+    /// The guest's `/etc/localdesktop`, likewise kept outside `rootfs_dir`.
+    pub config_dir: PathBuf,
     pub native_library_dir: PathBuf,
     pub local_config: LocalConfig,
     pub permission_all_files_access: bool,
+    /// Android's timezone (e.g. `Europe/Berlin`), handed to the guest as `TZ`.
+    pub timezone: Option<String>,
 }
 
 impl ApplicationContext {
@@ -32,8 +40,12 @@ impl ApplicationContext {
         let cache_dir = Self::get_path(&mut env, &activity, "getCacheDir");
         let data_dir = Self::get_path(&mut env, &activity, "getFilesDir");
         let native_library_dir = Self::get_native_library_dir(&mut env, &activity);
-        let full_config_path = format!("{}{}", ARCH_FS_ROOT, CONFIG_FILE);
-        let local_config = parse_config(full_config_path);
+        let rootfs_dir = data_dir.join(ROOTFS_DIR);
+        let home_dir = data_dir.join(HOME_DIR);
+        let config_dir = data_dir.join(CONFIG_DIR);
+        let local_config = parse_config(config_dir.join(CONFIG_FILE).to_string_lossy().into_owned());
+        let timezone = Self::get_timezone(&mut env);
+        // Last: `run_in_jvm` detaches this thread when it returns, invalidating `env`.
         let permission_all_files_access = Self::is_all_files_access_granted(android_app);
 
         {
@@ -43,9 +55,13 @@ impl ApplicationContext {
             *context = Some(ApplicationContext {
                 cache_dir,
                 data_dir,
+                rootfs_dir,
+                home_dir,
+                config_dir,
                 native_library_dir,
                 local_config,
                 permission_all_files_access,
+                timezone,
             });
             log::info!(
                 "ApplicationContext initialized: {:?}",
@@ -93,6 +109,18 @@ impl ApplicationContext {
             .expect("Failed to convert native library dir to string")
             .into();
         PathBuf::from(path)
+    }
+
+    fn get_timezone(env: &mut JNIEnv) -> Option<String> {
+        let timezone = env
+            .call_static_method("java/util/TimeZone", "getDefault", "()Ljava/util/TimeZone;", &[])
+            .and_then(|it| it.l())
+            .ok()?;
+        let id = env
+            .call_method(timezone, "getID", "()Ljava/lang/String;", &[])
+            .and_then(|it| it.l())
+            .ok()?;
+        env.get_string(&JString::from(id)).ok().map(Into::into)
     }
 
     fn is_all_files_access_granted(android_app: &AndroidApp) -> bool {

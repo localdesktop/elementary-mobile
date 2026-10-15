@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=elementary Settings Daemon
+Comment=Started by a systemd user unit on elementary OS; there is no systemd here
+Exec=io.elementary.settings-daemon
+OnlyShowIn=Pantheon;
+NoDisplay=true
+X-GNOME-AutoRestart=true

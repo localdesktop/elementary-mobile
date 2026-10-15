@@ -1,0 +1,110 @@
+#!/bin/sh
+# Start elementary OS (Pantheon, Classic session) for the Android app.
+#
+# The app runs this inside proot, as the desktop user, once its Wayland compositor is listening.
+# Gala is an X11 window manager (mutter cannot run as a Wayland client), so the whole desktop
+# lives in one rootful Xwayland window that the compositor shows full screen:
+#
+#   Android compositor (/tmp/wayland-0) -> Xwayland :0 -> Gala, Wingpanel, Dock, apps
+#
+# The window size and UI scale come from /tmp/localdesktop-output, written by the app before it
+# launches us. After that Xwayland follows size changes by itself (rotation, split screen, DeX).
+
+set -u
+
+log() {
+    echo "elementary-mobile-session: $*" >&2
+}
+
+wayland_socket=${WAYLAND_DISPLAY:-wayland-0}
+case $wayland_socket in
+    /*) ;;
+    *) wayland_socket=/tmp/$wayland_socket ;;
+esac
+output_state=/tmp/localdesktop-output
+display_number=0
+
+i=0
+while [ "$i" -lt 100 ] && ! { [ -S "$wayland_socket" ] && [ -r "$output_state" ]; }; do
+    sleep 0.1
+    i=$((i + 1))
+done
+
+mode=1280x800
+scale=1
+if [ -r "$output_state" ]; then
+    . "$output_state"
+    mode=${LOCALDESKTOP_OUTPUT_MODE:-$mode}
+    scale=${LOCALDESKTOP_OUTPUT_SCALE:-$scale}
+fi
+
+export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# gnome-session will not start without a system bus; see /etc/elementary-mobile/dbus-system.conf.
+if ! dbus-send --system --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId >/dev/null 2>&1; then
+    mkdir -p /run/dbus
+    rm -f /run/dbus/system_bus_socket
+    dbus-daemon --config-file=/etc/elementary-mobile/dbus-system.conf --fork --nopidfile
+fi
+
+# X servers and session managers only create these socket directories when running as root.
+mkdir -p /tmp/.X11-unix /tmp/.ICE-unix
+chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix 2>/dev/null
+
+# Windowed rather than -fullscreen: the compositor already sizes the window to the screen, and a
+# windowed rootful Xwayland resizes its root window whenever the compositor reconfigures it.
+# No MIT-SHM: proot emulates SysV shared memory per process, so pixels an app puts in a segment
+# never reach Xwayland and its windows stay blank (the panel and dock look like they are missing).
+rm -f "/tmp/.X$display_number-lock" "/tmp/.X11-unix/X$display_number"
+WAYLAND_DISPLAY=$wayland_socket Xwayland ":$display_number" -geometry "$mode" -shm -extension MIT-SHM -nolisten tcp -ac &
+xwayland=$!
+
+i=0
+while [ ! -S "/tmp/.X11-unix/X$display_number" ]; do
+    if ! kill -0 "$xwayland" 2>/dev/null || [ "$i" -ge 100 ]; then
+        log "Xwayland did not start"
+        exit 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+export DISPLAY=":$display_number"
+# Apps must draw through Xwayland: the compositor shows a single window.
+unset WAYLAND_DISPLAY
+export XDG_CURRENT_DESKTOP=Pantheon XDG_SESSION_DESKTOP=pantheon DESKTOP_SESSION=pantheon XDG_SESSION_TYPE=x11
+# Hides autostart entries for services that cannot exist under proot.
+export XDG_CONFIG_DIRS=/etc/elementary-mobile/xdg:/etc/xdg
+export GDK_BACKEND=x11
+# Rendering is CPU only (llvmpipe). GTK 4's GL renderer draws garbage on it through Xwayland.
+export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=cairo
+# Browser sandboxes need user namespaces, which Android does not give apps.
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 ELECTRON_DISABLE_SANDBOX=1
+export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
+# Android kills apps with more than 32 child processes, so the session avoids helper processes:
+# a forked bus instead of dbus-run-session, and Gala started directly rather than supervised.
+bus_pid_file="$XDG_RUNTIME_DIR/session-bus.pid"
+
+# Start a fresh session after "Log Out", like a display manager with automatic login.
+while kill -0 "$xwayland" 2>/dev/null; do
+    DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --fork --print-address=1 --print-pid=3 3>"$bus_pid_file")
+    export DBUS_SESSION_BUS_ADDRESS
+
+    gsettings set org.gnome.desktop.interface scaling-factor "$scale"
+
+    # Gala runs outside gnome-session: it reports readiness to systemd only, so as a session
+    # component it would hit gnome-session's registration timeout. Its screen locker also crashes
+    # without XDG_SESSION_ID when logind is missing.
+    XDG_SESSION_ID=elementary-mobile gala &
+    gala=$!
+
+    gnome-session --session=elementary-mobile
+
+    # Closing the bus also ends the panel, dock and apps of this session.
+    kill "$gala" "$(cat "$bus_pid_file")" 2>/dev/null
+    wait "$gala" 2>/dev/null
+    sleep 1
+done
+log "Xwayland exited"

@@ -1,132 +1,131 @@
-# Local Desktop
+# elementary Mobile
 
-Local Desktop helps you run a desktop Linux environment on your Android device.
+elementary OS on your Android device, offline. Install the APK, tap the icon, and you get the
+Pantheon desktop with Files, Terminal, Code, Web and System Settings. Nothing is downloaded:
+the whole OS ships inside the APK.
 
-**Note**: It is expected that you already have a usable desktop experience, i.e., a large enough display (tablet or DEX), a physical keyboard, and optionally a mouse/trackpad. **Local Desktop aims to bridge the gap between the two platforms, not trying to "simulate" the desktop experience by introducing inconvenient interactions**.
+This is a fork of [Local Desktop](https://github.com/localdesktop/localdesktop.github.io), which
+installs Arch Linux with Xfce on first launch. elementary Mobile keeps Local Desktop's engine (a
+Wayland compositor in the Android NDK plus proot) and replaces what runs on it.
+
+**Note**: like Local Desktop, this expects a large enough display (a tablet, a foldable or DeX),
+ideally with a keyboard and mouse. It brings a desktop to Android; it does not turn the desktop
+into a phone UI.
 
 ## How it works
 
-1. An Arch Linux ARM64 filesystem is set up inside the app's internal storage.
-2. Proot mounts the filesystem and provides a chroot-like environment.
-3. A minimal built-in Wayland compositor runs in Android NDK.
-4. An Xfce Wayland session launches inside the chroot and renders back to the Android native activity.
+1. The APK carries an elementary OS 8 root filesystem as a ~190 MB xz archive
+   (`elementary-os-rootfs.tar.xz`, ~1 GB unpacked).
+2. On first launch the app streams it straight out of the APK into its private storage, showing
+   progress, then opens the desktop. No restart, no network.
+3. proot runs the OS in a chroot-like environment, as the user `elementary`.
+4. The app's built-in Wayland compositor shows one rootful Xwayland window, and Gala (elementary's
+   window manager, which is X11-only when it cannot drive the display itself) runs the Pantheon
+   Classic session inside it: Wingpanel, the Dock, notifications and the apps.
 
-![POC](./gh-pages/static/img/proof-of-concept.png)
-_Proof of Concept: A Pixel Tablet running the XFCE desktop environment inside a Proot-based ARM64 Linux. No configuration is required; just install and go._
+Rendering is done on the CPU (Mesa llvmpipe): Android's GPU drivers cannot be used from a glibc
+userland.
 
-## Getting Started
+### Updates
 
-### How to build an APK
+The OS is never updated in place. A newer APK that carries a different archive replaces the OS on
+its next launch. Your files survive because they are kept outside the OS:
 
-#### Termux
+| On the device (`/data/data/app.elementarymobile/files/`) | In elementary OS            |
+| -------------------------------------------------------- | --------------------------- |
+| `rootfs/`                                                | `/` (replaced on updates)   |
+| `home/`                                                  | `/home` (kept)              |
+| `config/`                                                | `/etc/localdesktop` (kept)  |
 
-You can build the Local Desktop APK directly on your Android device. This is simple because no cross-compilation is needed. However, we only ship prebuilt libs for arm64, so this option only works on ARM64.
+Packages added with `apt` while online live in the OS, so they are gone after an update that
+replaces it.
 
-For Termux, there are two supported approaches:
+### Configuration
 
-1. **Simple build (no `xbuild`)**
+`/etc/localdesktop/localdesktop.toml` works as in Local Desktop, minus the package install
+commands (there is nothing to install):
 
-   Install Rust:
+```toml
+[user]
+username = "elementary"
 
-   ```
-   pkg i rust
-   ```
-
-   Then run:
-
-   ```bash
-   cargo run
-   ```
-
-   This uses the built-in Rust APK builder and writes `localdesktop.apk` in the project root.
-
-2. **`xbuild`-based build**
-
-   This matches the desktop cross-build pipeline more closely and is better for repeated APK builds:
-
-   ```bash
-   bash scripts/build-termux.sh
-   ```
-
-   This script installs the required Termux packages, bootstraps the patched `xbuild` toolchain, downloads the Android SDK build-tools, and writes the APK to `target/x/release/android/localdesktop.apk`.
-
-For the simple `cargo run` flow, you can install the APK with `termux-open localdesktop.apk`, but in some cases you may need to `mv localdesktop.apk ~/storage/downloads` and install it from there. Make sure you have run `termux-setup-storage` before moving it outside Termux.
-
-#### Linux/Mac/Windows
-
-The above option is suitable for quick development on Android. However, if you need to build an AAB (for distribution to Google Play), debug with Visual Studio Code, or compile for unsupported targets (like x64 Android), then you need to cross-build it from your PC.
-Along with Rust, please make sure you have these components installed:
-
-```
-brew install llvm lld gradle@8
+[command]
+# The default; change it to start something else instead of the elementary session.
+launch = "export PIPEWIRE_RUNTIME_DIR=/tmp PULSE_SERVER=unix:/tmp/pulse/native WAYLAND_DISPLAY=/tmp/wayland-0; exec /usr/local/bin/elementary-mobile-session 2>&1"
 ```
 
-Then install our local version of xbuild:
+Crash reporting is off. Set `SENTRY_DSN` when building to send crashes to your own Sentry project.
+
+### Android's child process limit
+
+Android 12 and later kill an app's child processes once it has more than 32 of them (the "phantom
+process killer"); everything in the desktop then disappears at once. The session is trimmed to
+about 23 processes at idle, which leaves room for a couple of apps (Terminal and Web together use
+6). To open more at the same time, lift the limit once:
+
+- Android 14 and later: Developer options → **Disable child process restrictions**.
+- Otherwise, from a computer with adb:
+
+  ```bash
+  adb shell device_config set_sync_disabled_for_tests persistent
+  adb shell device_config put activity_manager max_phantom_processes 2147483647
+  adb shell settings put global settings_enable_monitor_phantom_procs false
+  ```
+
+### What does not work
+
+- Apps elementary now ships only as Flatpaks (Calculator, Screenshot, Music, Videos, Camera, Maps,
+  Photos) and AppCenter: Flatpak needs Linux user namespaces, which Android does not give apps.
+  Web (Epiphany), Evince and File Roller are included as native packages instead.
+- Hardware and system services: network, Bluetooth, power, printing and display settings are
+  managed by Android. Screen locking is too.
+- Translations are stripped to keep the APK small, so the desktop is in English.
+- Shut down and restart in the session menu (there is no logind). Log out starts a fresh session.
+- Known rough edges: the panel and dock sometimes appear only after the first tap, and sound is
+  not working reliably yet.
+
+## Building
+
+You need Rust, Docker with buildx, and the Android toolchain used by Local Desktop
+(`brew install llvm lld gradle@8` on a Mac).
+
+### 1. Build the OS image
+
+```bash
+scripts/build-rootfs.sh
+```
+
+This builds `rootfs/Dockerfile` for linux/arm64 and writes
+`assets/rootfs/elementary-os-rootfs.tar.xz` plus its manifest. It runs natively on Apple silicon,
+arm64 Linux and GitHub's `ubuntu-24.04-arm` runners (about 5 minutes); on x86 machines Docker needs
+QEMU and is much slower. The image is:
+
+- `ubuntu:24.04` with `ppa:elementary-os/stable` and `ppa:elementary-os/os-patches`, the same
+  packages elementary OS is built from (elementary publishes no arm64 image to start from);
+- the package selection in [`rootfs/packages.list`](rootfs/packages.list), trimmed by the dpkg
+  filters in `rootfs/overlay/etc/dpkg/dpkg.cfg.d/`;
+- an Xwayland with one patch ([`rootfs/patches/`](rootfs/patches/)) so that Gala keeps the window
+  size instead of switching to a 5120×2880 mode;
+- the session scripts and defaults in [`rootfs/overlay/`](rootfs/overlay/).
+
+### 2. Build the APK
 
 ```bash
 cargo install --path patches/xbuild/xbuild --force
 x build --release --platform android --arch arm64 --format apk
 ```
 
-Alternatively, trigger the default build task by pressing `Ctrl+Shift+B`.
+The APK is about 210 MB, almost all of it the OS image.
 
-You can find the output APK in:
-
-```bash
-open target/x/release/android/gradle/app/build/outputs/apk/debug/app-debug.apk
-```
-
-#### Docker
-
-If you have issues setting up your local development environment as detailed above, you can make use of the included Dockerfile to build an APK on a single command. This will take a long time so it's not recommended if you can make use of any of the other methods
+### Tests
 
 ```bash
-make build-docker
+cargo test --lib                                          # on a PC or in Termux
+cargo test --lib -- --ignored installs_the_built_archive  # unpacks the image you built
 ```
 
-You can find the output APK in:
+## Credits
 
-```bash
-open target/x/release/android/localdesktop.apk
-```
-
-### How to develop
-
-#### Termux
-
-We recommend the following setup, but feel free to use your own favorite tools for development:
-
-```
-pkg install helix helix-grammars rust-analyzer
-```
-
-A wonderful thing about developing directly on Android is that an agent like [Codex on Termux](https://github.com/DioNanos/codex-termux) can **test the code for you** by running unit tests, reading the output, understanding what went wrong, and trying again. In my experience, this is not possible when cross-developing on other operating systems, so you have to run the tests yourself.
-
-![Developing on Android](./gh-pages/static/img/dev-from-android.webp)
-
-
-#### Linux/Mac/Windows
-
-Recommended setup:
-
-- **IDE**: Visual Studio Code
-
-- **Extensions**:
-
-  - [Rust Analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
-  - [Android Debug](https://marketplace.visualstudio.com/items?itemName=nisargjhaveri.android-debug)
-  - [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)
-
-- **Instructions**:
-
-  1. Open Visual Studio Code.
-  2. Launch the `[Android] Debug` configuration from the debug panel. This will:
-     - Build the Rust code into an APK.
-     - Install the APK on a selectable device, and launch the app in debug mode.
-     - Redirect stdout/stderr output to the terminal.
-
-![It is easy to debug](./gh-pages/static/img/debugable.webp)
-
-> **Tip**: You can debug the app on either a physical device or a virtual device.
-
-For more instructions on how to work on this project, please visit the [Developer Manual](https://localdesktop.github.io/docs/developer/how-it-works).
+Local Desktop by its contributors, GPL-3.0 (see [LICENSE](LICENSE)). elementary OS and Pantheon by
+[elementary, Inc.](https://elementary.io) and contributors; the OS image is assembled from their
+public packages. This project is not affiliated with or endorsed by elementary, Inc.

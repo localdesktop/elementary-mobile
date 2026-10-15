@@ -1,0 +1,8 @@
+// The OS is replaced as a whole by updating the APK, so apt is only for extras the user adds
+// while online. Keep those installs lean.
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+
+// Android only lets processes in its inet group open sockets. apt's unprivileged _apt sandbox
+// user can lose that group, and proot gives no real privilege separation anyway.
+APT::Sandbox::User "root";

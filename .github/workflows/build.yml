@@ -100,13 +100,45 @@ jobs:
             core.info(`build signed APK: ${shouldBuild}`);
             core.setOutput("should_build", shouldBuild ? "true" : "false");
 
-  build:
+  rootfs:
+    name: Build elementary OS image
     needs: validate-release-label
+    if: github.event_name != 'pull_request' || needs.validate-release-label.outputs.should_build == 'true'
+    # Native arm64: the image is linux/arm64 and building it under QEMU takes hours.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the root filesystem
+        run: scripts/build-rootfs.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check that the app can unpack it
+        run: cargo test --release --lib core:: -- --include-ignored
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elementary-os-rootfs
+          path: assets/rootfs/
+          if-no-files-found: error
+
+  build:
+    needs: [validate-release-label, rootfs]
     if: github.event_name != 'pull_request' || needs.validate-release-label.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: elementary-os-rootfs
+          path: assets/rootfs/
 
       - name: Setup Gradle 8.14.3
         uses: gradle/actions/setup-gradle@v4

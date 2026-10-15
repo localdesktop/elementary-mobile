@@ -6,15 +6,16 @@ use crate::android::{
     backend::{
         pipewire_standalone_aaudio,
         wayland::{
-            bind, centralize, centralize_injected_keyboard, handle, write_guest_output_state,
+            bind, centralize, centralize_injected_keyboard, handle,
+            write_guest_output_state,
             CentralizedEvent, State,
         },
         webview::ErrorVariant,
     },
-    proot::launch::launch,
+    proot::{launch::launch, setup::build_wayland_backend},
     utils::{
         ndk::{self, run_in_jvm},
-        webview::show_webview_popup,
+        webview::{close_webview_popups, show_webview_popup},
     },
 };
 use crate::core::config;
@@ -71,7 +72,7 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
         Some((0, 0).into()),
     );
 
-    let guest_scale = guest_scale_factor.round().max(1.0) as i32;
+    let guest_scale = crate::core::config::guest_ui_scale(guest_scale_factor);
     write_guest_output_state(window_size.w, window_size.h, guest_scale);
 
     for surface in backend.compositor.state.xdg_shell_state.toplevel_surfaces() {
@@ -99,6 +100,9 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                     }
                     ErrorVariant::Unsupported => {
                         format!("file:///android_asset/unsupported.html")
+                    }
+                    ErrorVariant::MissingOs => {
+                        format!("file:///android_asset/setup-progress.html?missing-os=1")
                     }
                 };
                 let android_app = self.frontend.android_app.clone();
@@ -140,7 +144,23 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: AppUserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppUserEvent) {
+        if let AppUserEvent::SetupFinished = event {
+            if let PolarBearBackend::WebView(_) = self.backend {
+                log::info!("Setup finished, switching to the desktop");
+                run_in_jvm(
+                    |env, _| close_webview_popups(env),
+                    self.frontend.android_app.clone(),
+                );
+                self.backend =
+                    PolarBearBackend::Wayland(build_wayland_backend(self.frontend.android_app.clone()));
+                // Same as coming back to the app: bind the renderer and start the session. If the
+                // app is in the background, this fails quietly and the next resume does it.
+                self.resumed(event_loop);
+            }
+            return;
+        }
+
         let PolarBearBackend::Wayland(backend) = &mut self.backend else {
             accessibility::drain_pending_events();
             return;

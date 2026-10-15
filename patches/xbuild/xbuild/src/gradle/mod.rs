@@ -191,6 +191,11 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
                         useLegacyPackaging true
                     }}
                 }}
+                // Already-compressed assets (the bundled OS image) gain nothing from deflate and
+                // are read faster stored.
+                androidResources {{
+                    noCompress 'xz'
+                }}
                 def keystoreFile = file("release-key.jks")
                 if (keystoreFile.exists()) {{
                     signingConfigs {{

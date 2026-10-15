@@ -1,0 +1,87 @@
+# Packages installed into the elementary OS root filesystem (one per line, # for comments).
+# Installed with --no-install-recommends on top of ubuntu:24.04 plus ppa:elementary-os/stable
+# and ppa:elementary-os/os-patches. Keep it lean: every MiB here ships inside the APK.
+#
+# Not included on purpose:
+# - Apps elementary now ships as Flatpak-only wrappers (Calculator, Screenshot, Camera, Music,
+#   Videos, Maps, Photos, and the org.gnome.* Epiphany/Evince/File Roller wrappers). Flatpak needs
+#   user namespaces, which Android does not give apps. Native Ubuntu builds are used instead.
+# - AppCenter, the installer/greeter, plymouth, network/bluetooth/power/printing stacks: there is
+#   no package manager daemon, display manager, boot, or hardware access under proot.
+# - The Language & Region plug: it installs language packs through aptdaemon (and pulls in
+#   polkit and Python for it), and translations are stripped from this image anyway.
+# - x11-xserver-utils: xrdb drags in the C preprocessor (~26 MiB).
+
+# Branding and apt pinning from elementary OS
+base-files
+elementary-os-overlay
+
+# Pantheon shell (Classic session: Gala as the X11 window manager inside rootful Xwayland)
+gala
+gnome-session-bin
+gnome-settings-daemon
+io.elementary.dock
+io.elementary.notifications
+io.elementary.quick-settings
+io.elementary.settings-daemon
+io.elementary.wingpanel
+pantheon-xsession-settings
+slingshot-launcher
+wingpanel-indicator-datetime
+wingpanel-indicator-keyboard
+wingpanel-indicator-notifications
+wingpanel-indicator-sound
+
+# Look and feel
+elementary-default-settings
+elementary-icon-theme
+elementary-wallpapers
+fonts-dejavu-core
+fonts-inter
+fonts-open-sans
+fonts-roboto-mono-elementary
+io.elementary.sound-theme
+io.elementary.stylesheet
+
+# Display and session plumbing
+dbus-x11
+dconf-service
+gnome-keyring
+libgl1-mesa-dri
+xwayland
+
+# Core elementary apps
+io.elementary.code
+io.elementary.monitor
+io.elementary.settings
+io.elementary.settings.applications
+io.elementary.settings.datetime
+io.elementary.settings.desktop
+io.elementary.settings.display
+io.elementary.settings.keyboard
+io.elementary.settings.mouse-touchpad
+io.elementary.settings.notifications
+io.elementary.settings.sound
+io.elementary.settings.system
+io.elementary.terminal
+pantheon-files
+
+# Native replacements for elementary's Flatpak-only defaults
+epiphany-browser
+evince
+file-roller
+
+# On-screen keyboard (toggled from Quick Settings for touch-only use)
+onboard
+
+# Command-line basics
+ca-certificates
+# elementary's bash prompt setup calls gettext
+gettext-base
+less
+locales
+nano
+sudo
+tzdata
+xdg-user-dirs
+xdg-utils

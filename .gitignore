@@ -5,3 +5,5 @@ localdesktop.apk
 /build/
 /manuals/
 /dist/
+# Built by scripts/build-rootfs.sh (bundled into the APK, too large for git)
+/assets/rootfs/

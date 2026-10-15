@@ -1,0 +1,52 @@
+# Keep the root filesystem small: it ships compressed inside the APK and is unpacked on the device.
+# The ubuntu:24.04 base image already drops man pages, translations and docs except copyright
+# files (/etc/dpkg/dpkg.cfg.d/excludes); this trims the rest of what a phone never reads.
+
+path-exclude=/usr/share/doc/*/changelog*
+path-exclude=/usr/share/doc/*/NEWS*
+path-exclude=/usr/share/doc/*/README*
+path-exclude=/usr/share/help/*
+path-exclude=/usr/share/gtk-doc/*
+path-exclude=/usr/share/info/*
+path-exclude=/usr/share/lintian/*
+path-exclude=/usr/share/linda/*
+path-exclude=/usr/share/bug/*
+
+# ibus ships emoji annotations for every language (~120 MiB); keep English. Same for GTK 4's
+# emoji chooser.
+path-exclude=/usr/share/ibus/dicts/emoji-*
+path-include=/usr/share/ibus/dicts/emoji-en.dict
+path-exclude=/usr/share/gtk-4.0/emoji/*
+path-include=/usr/share/gtk-4.0/emoji/en.data
+
+# udev's hardware database (~20 MiB): there is no hardware to describe under proot.
+path-exclude=/usr/lib/udev/hwdb.d/*
+path-exclude=/usr/lib/udev/hwdb.bin
+
+# Icon themes nothing inherits from here: elementary -> Adwaita -> hicolor. gnome-icon-theme's
+# postinst registers alternatives under places/, so those few icons have to stay.
+path-exclude=/usr/share/icons/Humanity*
+path-exclude=/usr/share/icons/ubuntu-mono-*
+path-exclude=/usr/share/icons/gnome/*
+path-include=/usr/share/icons/gnome/index.theme
+path-include=/usr/share/icons/gnome/*/places/*
+
+# Inter: keep the text faces the stylesheet uses, drop InterDisplay and the extreme weights.
+path-exclude=/usr/share/fonts/opentype/inter/*
+path-include=/usr/share/fonts/opentype/inter/Inter-Regular.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-Italic.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-Medium.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-MediumItalic.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-SemiBold.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-SemiBoldItalic.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-Bold.otf
+path-include=/usr/share/fonts/opentype/inter/Inter-BoldItalic.otf
+
+# Wallpapers: the default plus a few small ones (the full set is ~70 MiB).
+path-exclude=/usr/share/backgrounds/*
+path-include=/usr/share/backgrounds/elementaryos-default
+path-include=/usr/share/backgrounds/A?Large?Body?of?Water*
+path-include=/usr/share/backgrounds/Snow-Capped?Mountain.jpg
+path-include=/usr/share/backgrounds/Sunset?by?the?Pier.jpg
+path-include=/usr/share/backgrounds/Photo?by?SpaceX.jpg
+path-include=/usr/share/backgrounds/Martin?Adams.jpg

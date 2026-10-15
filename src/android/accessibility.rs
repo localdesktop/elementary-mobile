@@ -13,6 +13,8 @@ use winit::{event::ElementState, event_loop::EventLoopProxy};
 #[derive(Clone, Copy, Debug)]
 pub enum AppUserEvent {
     AccessibilityInputReady,
+    /// The first-run install finished; switch from the progress page to the desktop.
+    SetupFinished,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +50,23 @@ pub fn register_event_loop_proxy(proxy: EventLoopProxy<AppUserEvent>) {
         .lock()
         .expect("Failed to lock accessibility bridge");
     bridge.proxy = Some(proxy);
+}
+
+/// Wake the event loop with `event`, from any thread.
+pub fn send_user_event(event: AppUserEvent) {
+    let proxy = bridge()
+        .lock()
+        .expect("Failed to lock accessibility bridge")
+        .proxy
+        .clone();
+    match proxy {
+        Some(proxy) => {
+            if let Err(err) = proxy.send_event(event) {
+                log::warn!("Failed to send {event:?} to the event loop: {err}");
+            }
+        }
+        None => log::warn!("No event loop to send {event:?} to"),
+    }
 }
 
 pub fn set_runtime_active(active: bool) {

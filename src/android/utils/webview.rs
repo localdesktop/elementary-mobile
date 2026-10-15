@@ -1,11 +1,26 @@
-use std::thread;
+use std::sync::Mutex;
 
-use jni::objects::{JObject, JValue};
+use jni::objects::{GlobalRef, JObject, JValue};
 use jni::sys::_jobject;
 use jni::JNIEnv;
 use winit::platform::android::activity::AndroidApp;
 
+/// Loopers of the threads currently showing a popup, so `close_webview_popups` can end them.
+static POPUP_LOOPERS: Mutex<Vec<GlobalRef>> = Mutex::new(Vec::new());
+
+/// Close every popup opened by `show_webview_popup`. Can be called from any thread:
+/// `Looper.quit()` is thread-safe, and each popup is dismissed by its own thread once its loop
+/// returns, as Android requires.
+pub fn close_webview_popups(env: &mut JNIEnv) {
+    for looper in POPUP_LOOPERS.lock().unwrap().drain(..) {
+        if env.call_method(&looper, "quit", "()V", &[]).is_err() {
+            let _ = env.exception_clear();
+        }
+    }
+}
+
 /// A function that can be passed into `run_in_jvm` to show a WebView popup.
+/// Blocks running the popup's message loop until `close_webview_popups` is called.
 pub fn show_webview_popup(env: &mut JNIEnv, android_app: &AndroidApp, url: &str) {
     // Convert URL to JNI String
     let jurl = env.new_string(url).expect("Failed to create JNI string");
@@ -87,7 +102,7 @@ pub fn show_webview_popup(env: &mut JNIEnv, android_app: &AndroidApp, url: &str)
 
     // 3. Show PopupWindow
     env.call_method(
-        popup,
+        &popup,
         "showAtLocation",
         "(Landroid/view/View;III)V",
         &[
@@ -99,17 +114,21 @@ pub fn show_webview_popup(env: &mut JNIEnv, android_app: &AndroidApp, url: &str)
     )
     .unwrap();
 
-    // Start the Looper
+    let looper = env
+        .call_static_method("android/os/Looper", "myLooper", "()Landroid/os/Looper;", &[])
+        .and_then(|it| it.l())
+        .and_then(|looper| env.new_global_ref(looper))
+        .expect("Failed to get the popup thread's Looper");
+    POPUP_LOOPERS.lock().unwrap().push(looper);
+
+    // Start the Looper; returns once `close_webview_popups` quits it.
     env.call_static_method("android/os/Looper", "loop", "()V", &[])
         .expect("Failed to start Looper");
 
-    // Quit the Looper when done
-    let looper_class = env.find_class("android/os/Looper").unwrap();
-    let looper = env
-        .call_static_method(looper_class, "myLooper", "()Landroid/os/Looper;", &[])
-        .unwrap()
-        .l()
-        .unwrap();
-    env.call_method(&looper, "quit", "()V", &[])
-        .expect("Failed to quit Looper");
+    if env.call_method(&popup, "dismiss", "()V", &[]).is_err() {
+        let _ = env.exception_clear();
+    }
+    if env.call_method(&webview, "destroy", "()V", &[]).is_err() {
+        let _ = env.exception_clear();
+    }
 }

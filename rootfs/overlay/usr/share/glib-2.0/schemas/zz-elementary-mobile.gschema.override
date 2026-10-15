@@ -1,0 +1,22 @@
+# Defaults for elementary OS running inside the Android app.
+# Sections use the :Pantheon suffix so they win over elementary-default-settings' own :Pantheon
+# overrides (files are applied in name order; this one sorts last).
+
+# Android owns the screen lock, idle blanking and suspend.
+[org.gnome.desktop.session:Pantheon]
+idle-delay=uint32 0
+
+[org.gnome.desktop.screensaver:Pantheon]
+lock-enabled=false
+idle-activation-enabled=false
+
+[org.gnome.desktop.lockdown:Pantheon]
+disable-lock-screen=true
+
+# The app passes Android's timezone in TZ; there is no geoclue to detect it.
+[org.gnome.desktop.datetime:Pantheon]
+automatic-timezone=false
+
+# The stock list mostly names apps elementary now ships as Flatpaks, which cannot run here.
+[io.elementary.dock:Pantheon]
+launchers=['io.elementary.files.desktop', 'org.gnome.Epiphany.desktop', 'io.elementary.terminal.desktop', 'io.elementary.code.desktop', 'io.elementary.settings.desktop']

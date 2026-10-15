@@ -6,29 +6,26 @@ use std::{
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(not(test))]
-pub const ARCH_FS_ROOT: &str = "/data/data/app.polarbear/files/arch";
-#[cfg(test)]
-pub const ARCH_FS_ROOT: &str = "/data/local/tmp/arch";
+/// Where things live, relative to the app's files directory (`Context.getFilesDir()`).
+///
+/// The OS is kept apart from everything that must survive an APK update, because an update that
+/// carries a new OS replaces `ROOTFS_DIR` wholesale (see `core::rootfs`).
+pub const ROOTFS_DIR: &str = "rootfs";
+/// Bind-mounted over the guest's `/home`.
+pub const HOME_DIR: &str = "home";
+/// Bind-mounted over the guest's `/etc/localdesktop`, so `CONFIG_FILE` survives OS updates.
+pub const CONFIG_DIR: &str = "config";
 
-pub const ARCH_FS_ARCHIVE: &str = "https://github.com/termux/proot-distro/releases/download/v4.29.0/archlinux-aarch64-pd-v4.29.0.tar.xz";
-
-/// Project homepage, also the online documentation entry point.
-pub const DOCS_HOME_URL: &str = "https://localdesktop.github.io/";
-
-/// Download URL for the offline User Manual PDF matching the running version.
-/// The release asset is dot-free/hyphenated (GitHub turns spaces into dots).
-pub fn user_manual_url() -> String {
-    format!(
-        "https://github.com/localdesktop/localdesktop.github.io/releases/download/v{VERSION}/Local-Desktop-v{VERSION}-User-Manual.pdf"
-    )
-}
+/// The desktop user created in the bundled image (`ARG USERNAME` in rootfs/Dockerfile).
+pub const DEFAULT_USERNAME: &str = "elementary";
 
 pub const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 
 pub const MAX_PANEL_LOG_ENTRIES: usize = 100;
 
-pub const SENTRY_DSN: &str = "https://d8af27f864ade027ff81ecadea91b02e@o4509548388417536.ingest.de.sentry.io/4509548392480848";
+/// Crash reporting is off unless a DSN is supplied when building (`SENTRY_DSN=... x build ...`).
+/// This fork must not report into upstream Local Desktop's Sentry project.
+pub const SENTRY_DSN: Option<&str> = option_env!("SENTRY_DSN");
 
 /// PipeWire runtime path as seen from inside the proot guest.
 pub const PIPEWIRE_GUEST_RUNTIME_DIR: &str = "/tmp";
@@ -36,11 +33,22 @@ pub const PIPEWIRE_GUEST_RUNTIME_DIR: &str = "/tmp";
 /// PipeWire-Pulse socket as seen from inside the proot guest.
 pub const PULSE_GUEST_SERVER: &str = "unix:/tmp/pulse/native";
 
+/// Whole-number UI scale for the desktop from Android's density scale (dpi / 160).
+///
+/// Rounds down unless the density is close to the next step: a 420 dpi phone (2.625) gets 2x, a
+/// 480 dpi one 3x. Rounding to nearest gives 3x at 420 dpi, which leaves a desktop barely 360
+/// logical pixels wide in portrait.
+pub fn guest_ui_scale(scale_factor: f64) -> i32 {
+    ((scale_factor + 0.25).floor() as i32).max(1)
+}
+
+
 /// Make sure the config keys are all lowercase, and config values are single-line. Use \n for multi-line config values if needed
 /// If a key exists multiple time, the first entry is applied
 /// If a `try_` config exsists multiple time, the last entry is applied
 /// But in general, it is **invalid** to have duplicated config keys inside a TOML file
-pub const CONFIG_FILE: &str = "/etc/localdesktop/localdesktop.toml";
+/// The file name inside `CONFIG_DIR`, edited from the guest as /etc/localdesktop/localdesktop.toml.
+pub const CONFIG_FILE: &str = "localdesktop.toml";
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct LocalConfig {
@@ -49,7 +57,7 @@ pub struct LocalConfig {
 
     /// What happens if we don't assign this `#[serde(default)]` attribute?
     /// The answer: If the user omits the `[command]` group, the WHOLE config fails to parse
-    /// => The default `[user]` group is applied (with `username=root`) even if the `[user]` settings are completely valid.
+    /// => The default `[user]` group is applied (with the default username) even if the `[user]` settings are completely valid.
     /// => So make sure that every config group has a `#[serde(default)]` attribute to avoid invalid sections breaking unrelated parts of the config.
     #[serde(default)]
     pub command: CommandConfig,
@@ -63,41 +71,27 @@ pub struct UserConfig {
 impl Default for UserConfig {
     fn default() -> Self {
         Self {
-            username: "root".to_string(),
+            username: DEFAULT_USERNAME.to_string(),
         }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandConfig {
-    #[serde(default = "default_check")]
-    pub check: String,
-    #[serde(default = "default_install")]
-    pub install: String,
+    /// Runs inside proot as `[user] username` once the compositor is up, and should keep running
+    /// for as long as the desktop does.
     #[serde(default = "default_launch")]
     pub launch: String,
 }
 
-fn default_check() -> String {
-    "pacman -Q noto-fonts && pacman -Q xfce4-session && pacman -Q xfce4-panel && pacman -Q xfce4-settings && pacman -Q xfce4-terminal && pacman -Q thunar && pacman -Q xfdesktop && pacman -Q xfconf && pacman -Q labwc && pacman -Q wlr-randr && pacman -Q xorg-xwayland && pacman -Q xdg-desktop-portal && pacman -Q xdg-desktop-portal-gtk && pacman -Q onboard && pacman -Q firefox && pacman -Q evince && pacman -Q pipewire && pacman -Q pipewire-audio && pacman -Q pipewire-alsa"
-        .to_string()
-}
-
-fn default_install() -> String {
-    "stdbuf -oL pacman -Syu --needed --noconfirm --noprogressbar noto-fonts xfce4 labwc wlr-randr xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk onboard firefox evince pipewire pipewire-audio pipewire-alsa"
-        .to_string()
-}
-/// Direct the desktop session to the compositor and the host PipeWire socket.
+/// Starts elementary OS; see rootfs/overlay/usr/local/bin/elementary-mobile-session.
 fn default_launch() -> String {
-    format!("export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR} PULSE_SERVER={PULSE_GUEST_SERVER}; XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=XFCE /usr/local/bin/startxfce4-localdesktop 2>&1")
-        .to_string()
+    format!("export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR} PULSE_SERVER={PULSE_GUEST_SERVER} WAYLAND_DISPLAY=/tmp/{WAYLAND_SOCKET_NAME}; exec /usr/local/bin/elementary-mobile-session 2>&1")
 }
 
 impl Default for CommandConfig {
     fn default() -> Self {
         Self {
-            check: default_check(),
-            install: default_install(),
             launch: default_launch(),
         }
     }
@@ -210,15 +204,11 @@ mod tests {
                 username = "alice"
 
                 [command]
-                check = "check-cmd"
-                install = "install-cmd"
                 launch = "launch-cmd"
             "#,
             |full_config_path| {
                 let config = parse_config(full_config_path);
                 assert_eq!(config.user.username, "alice");
-                assert_eq!(config.command.check, "check-cmd");
-                assert_eq!(config.command.install, "install-cmd");
                 assert_eq!(config.command.launch, "launch-cmd");
             },
         );
@@ -233,16 +223,13 @@ mod tests {
                 try_username = "testuser"
 
                 [command]
-                check = "check-cmd"
-                try_check = "try-check"
-                install = "install-cmd"
                 launch = "launch-cmd"
+                try_launch = "try-launch"
             "#,
             |full_config_path| {
                 let config = parse_config(full_config_path);
                 assert_eq!(config.user.username, "testuser");
-                assert_eq!(config.command.check, "try-check");
-                assert_eq!(config.command.install, "install-cmd")
+                assert_eq!(config.command.launch, "try-launch")
             },
         );
     }
@@ -271,5 +258,16 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn picks_whole_number_scales() {
+        assert_eq!(guest_ui_scale(1.0), 1); // mdpi
+        assert_eq!(guest_ui_scale(1.5), 1); // hdpi
+        assert_eq!(guest_ui_scale(2.0), 2); // xhdpi
+        assert_eq!(guest_ui_scale(2.625), 2); // 420 dpi
+        assert_eq!(guest_ui_scale(2.75), 3); // 440 dpi
+        assert_eq!(guest_ui_scale(3.5), 3); // 560 dpi
+        assert_eq!(guest_ui_scale(0.75), 1);
     }
 }

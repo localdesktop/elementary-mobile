@@ -1,0 +1,28 @@
+Description: rootful: advertise the current size as the preferred RandR mode
+ In rootful mode Xwayland lists a set of fake modes for resolution-change
+ emulation, sorted largest first, and marks the first one (5120x2880) as
+ preferred. Window managers such as mutter apply the preferred mode when they
+ start and again whenever the mode list changes (every time the rootful window
+ is resized), which renders the whole desktop at 5120x2880. Put the current
+ size first so it is the preferred mode and window managers keep it.
+Author: elementary-mobile
+--- a/hw/xwayland/xwayland-output.c
++++ b/hw/xwayland/xwayland-output.c
+@@ -1133,6 +1133,17 @@ xwl_randr_add_modes_fixed(struct xwl_output *xwl_output,
+     }
+ 
+     qsort(modes, nmodes, sizeof(RRModePtr), mode_sort);
++
++    for (i = 0; i < nmodes; i++) {
++        if (modes[i]->mode.width == current_width &&
++            modes[i]->mode.height == current_height) {
++            mode = modes[i];
++            memmove(&modes[1], &modes[0], i * sizeof(RRModePtr));
++            modes[0] = mode;
++            break;
++        }
++    }
++
+     RROutputSetModes(xwl_output->randr_output, modes, nmodes, 1);
+     free(modes);
+ 

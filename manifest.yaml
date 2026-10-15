@@ -1,6 +1,11 @@
 icon: assets/icon.png
 android:
   assets:
+    # The bundled OS, built by scripts/build-rootfs.sh. Already compressed, so stored as is: the
+    # app streams it straight out of the APK on first launch.
+    - path: assets/rootfs/elementary-os-rootfs.tar.xz
+      alignment: unaligned
+    - assets/rootfs/elementary-os-rootfs.json
     - assets/setup-progress.html
     - assets/unsupported.html
     - assets/ld-linux-aarch64.so.1
@@ -9,12 +14,16 @@ android:
     - assets/libs
   gradle: true
   manifest:
-    package: app.polarbear
+    # Different from upstream Local Desktop (app.polarbear) so both can be installed. The Java
+    # service below keeps its app.polarbear class name: JNI symbols in src/android/accessibility.rs
+    # are bound to it, and a component's class does not have to match the application ID.
+    package: app.elementarymobile
     sdk:
       min_sdk_version: 21
       target_sdk_version: 33
     application:
-      label: "Local Desktop"
+      label: "elementary Mobile"
+      theme: "@style/AppTheme"
       extract_native_libs: true # Required for proot invocations
       use_cleartext_traffic: true # Required for connecting to ws://127.0.0.1, see assets/setup-progress.html
       services:
