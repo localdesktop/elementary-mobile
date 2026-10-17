@@ -117,6 +117,26 @@ x build --release --platform android --arch arm64 --format apk
 
 The APK is about 210 MB, almost all of it the OS image.
 
+### Releases
+
+Releases work like Local Desktop's. Every PR to `main` carries one release label
+(`release:feature`, `release:bugfix`, …, or `release:docs` for no release). The label bumps the
+version on the PR branch; merging tags `vX.Y.Z` with the PR description as release notes, and the
+`Build APK` workflow publishes a GitHub release with the signed APK. To release by hand, push a
+`vX.Y.Z` tag matching the version in `Cargo.toml`, or run `Build APK` on that tag.
+
+Repository secrets:
+
+| Secret | What |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | The release keystore, `base64 -i release-key.jks` |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password |
+| `ANDROID_KEY_ALIAS` | Key alias in the keystore |
+| `ANDROID_KEY_PASSWORD` | Key password |
+| `PAT` (optional) | Token that can push to this repo; without it the release build is started with `workflow_dispatch` instead of by the tag push |
+
+There is no AAB: the bundled OS puts it over Google Play's 200 MB limit for the base module.
+
 ### Tests
 
 ```bash

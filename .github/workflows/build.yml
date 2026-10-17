@@ -1,4 +1,4 @@
-name: Build APK & AAB
+name: Build APK
 
 on:
   workflow_dispatch:
@@ -119,7 +119,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check that the app can unpack it
-        run: cargo test --release --lib core:: -- --include-ignored
+        run: "cargo test --release --lib core:: -- --include-ignored"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -191,11 +191,17 @@ jobs:
           git log -1 --pretty=%B > "${{ steps.release_notes.outputs.path }}"
 
       - name: Setup signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::Signing secrets are missing. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD to the repository secrets (see README, Releases)."
+            exit 1
+          fi
           mkdir -p target/x/release/android/gradle/app
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > target/x/release/android/gradle/app/release-key.jks
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > target/x/release/android/gradle/app/release-key.jks
           # Verify keystore
-          keytool -list -v -keystore target/x/release/android/gradle/app/release-key.jks -storepass $ANDROID_KEYSTORE_PASSWORD
+          keytool -list -keystore target/x/release/android/gradle/app/release-key.jks -storepass "$ANDROID_KEYSTORE_PASSWORD" > /dev/null
 
       - name: Update manifest.yaml to target API 35
         run: |
@@ -240,8 +246,8 @@ jobs:
 
       - name: Rename APK
         run: |
-          mv target/x/release/android/gradle/app/build/outputs/apk/debug/app-debug.apk target/x/localdesktop-${{ steps.extract_version.outputs.version }}-debug.apk
-          mv target/x/release/android/gradle/app/build/outputs/apk/release/app-release.apk target/x/localdesktop-${{ steps.extract_version.outputs.version }}.apk
+          mv target/x/release/android/gradle/app/build/outputs/apk/debug/app-debug.apk target/x/elementary-mobile-${{ steps.extract_version.outputs.version }}-debug.apk
+          mv target/x/release/android/gradle/app/build/outputs/apk/release/app-release.apk target/x/elementary-mobile-${{ steps.extract_version.outputs.version }}.apk
 
       - name: Prepare PR APK artifact
         id: pr_apk_artifact
@@ -257,9 +263,9 @@ jobs:
             SAFE_REF="pr-${PR_NUMBER}"
           fi
           SHORT_SHA="${HEAD_SHA:0:7}"
-          ARTIFACT_FILE="localdesktop-${VERSION}-${SAFE_REF}-${SHORT_SHA}-release.apk"
+          ARTIFACT_FILE="elementary-mobile-${VERSION}-${SAFE_REF}-${SHORT_SHA}-release.apk"
           ARTIFACT_PATH="target/x/${ARTIFACT_FILE}"
-          cp "target/x/localdesktop-${VERSION}.apk" "$ARTIFACT_PATH"
+          cp "target/x/elementary-mobile-${VERSION}.apk" "$ARTIFACT_PATH"
           echo "path=${ARTIFACT_PATH}" >> "$GITHUB_OUTPUT"
 
       - name: Upload PR release APK
@@ -270,53 +276,15 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Build AAB
-        if: github.event_name != 'pull_request'
-        run: x build --release --platform=android --arch=arm64 --format=aab
-
-      - name: Rename AAB
-        if: github.event_name != 'pull_request'
-        run: |
-          mv target/x/release/android/gradle/app/build/outputs/bundle/debug/app-debug.aab target/x/localdesktop-${{ steps.extract_version.outputs.version }}-debug.aab
-          mv target/x/release/android/gradle/app/build/outputs/bundle/release/app-release.aab target/x/localdesktop-${{ steps.extract_version.outputs.version }}.aab
-      - name: Build User Manual PDFs
-        if: github.ref_type == 'tag'
-        run: |
-          # All-Rust: Typst renders the PDF, the image crate handles webp — no
-          # pandoc/LaTeX/Python, no apt packages needed. Six variants: every
-          # size (desktop/fold/phone) × theme (light/dark).
-          V="${{ steps.extract_version.outputs.version }}"
-          for size in desktop fold phone; do
-            for theme in light dark; do
-              cargo run --release --bin build_docs -- user "$size" "$theme"
-            done
-          done
-          # Rename build_docs' display names to versioned, dot-free release names
-          # (GitHub turns spaces into dots in asset download URLs).
-          cd manuals
-          mv "Local Desktop - User Manual.pdf"               "Local-Desktop-v$V-User-Manual.pdf"
-          mv "Local Desktop - User Manual (Dark).pdf"        "Local-Desktop-v$V-User-Manual-Dark.pdf"
-          mv "Local Desktop - User Manual (Fold).pdf"        "Local-Desktop-v$V-User-Manual-Fold.pdf"
-          mv "Local Desktop - User Manual (Fold, Dark).pdf"  "Local-Desktop-v$V-User-Manual-Fold-Dark.pdf"
-          mv "Local Desktop - User Manual (Phone).pdf"       "Local-Desktop-v$V-User-Manual-Phone.pdf"
-          mv "Local Desktop - User Manual (Phone, Dark).pdf" "Local-Desktop-v$V-User-Manual-Phone-Dark.pdf"
-
       - name: Create GitHub Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.PAT }}
-          name: Local Desktop v${{ steps.extract_version.outputs.version }}
+          token: ${{ secrets.PAT || github.token }}
+          name: elementary Mobile v${{ steps.extract_version.outputs.version }}
           tag_name: v${{ steps.extract_version.outputs.version }}
           body_path: ${{ steps.release_notes.outputs.path }}
+          # No AAB: the bundled OS image puts it over Google Play's 200 MB base module limit.
           files: |
-            target/x/localdesktop-${{ steps.extract_version.outputs.version }}.apk
-            target/x/localdesktop-${{ steps.extract_version.outputs.version }}-debug.apk
-            target/x/localdesktop-${{ steps.extract_version.outputs.version }}.aab
-            target/x/localdesktop-${{ steps.extract_version.outputs.version }}-debug.aab
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual.pdf
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual-Dark.pdf
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual-Fold.pdf
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual-Fold-Dark.pdf
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual-Phone.pdf
-            manuals/Local-Desktop-v${{ steps.extract_version.outputs.version }}-User-Manual-Phone-Dark.pdf
+            target/x/elementary-mobile-${{ steps.extract_version.outputs.version }}.apk
+            target/x/elementary-mobile-${{ steps.extract_version.outputs.version }}-debug.apk

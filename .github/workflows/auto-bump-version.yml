@@ -114,7 +114,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT || github.token }}
 
       - name: Sync release version commit
         if: needs.classify-pr.outputs.gh_pages_only != 'true'
@@ -230,6 +230,7 @@ jobs:
     if: github.event.action == 'closed' && github.event.pull_request.merged == true && needs.classify-pr.outputs.gh_pages_only != 'true' && !contains(github.event.pull_request.labels.*.name, 'release:docs')
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: read
 
@@ -266,7 +267,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT || github.token }}
 
       - name: Create release tag
         env:
@@ -304,3 +305,17 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -F "${RUNNER_TEMP}/release-notes.md"
           git push origin "refs/tags/${TAG}"
+
+      # A tag pushed with the default token does not trigger other workflows, so without a PAT
+      # start the release build directly (workflow_dispatch is allowed with the default token).
+      - name: Start release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_PAT: ${{ secrets.PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" = "true" ]; then
+            echo "The tag push triggers the release build."
+            exit 0
+          fi
+          VERSION=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -n 1)
+          gh workflow run build.yml --ref "v${VERSION}"
