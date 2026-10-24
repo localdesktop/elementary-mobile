@@ -1,4 +1,5 @@
 use crate::android::utils::application_context::get_application_context;
+use crate::core::cpuinfo::GUEST_CPUINFO;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -158,6 +159,10 @@ impl GuestProcess {
             .arg(format!("--bind={rootfs}/proc/.sysctl_entry_cap_last_cap:/proc/sys/kernel/cap_last_cap"))
             .arg(format!("--bind={rootfs}/proc/.sysctl_inotify_max_user_watches:/proc/sys/fs/inotify/max_user_watches"))
             .arg(format!("--bind={rootfs}/sys/.empty:/sys/fs/selinux"));
+
+        if context.rootfs_dir.join(GUEST_CPUINFO).is_file() {
+            process.arg(format!("--bind={rootfs}/{GUEST_CPUINFO}:/proc/cpuinfo"));
+        }
 
         // env vars
         process.arg("/usr/bin/env").arg("-i");

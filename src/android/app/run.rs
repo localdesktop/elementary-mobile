@@ -80,7 +80,8 @@ fn configure_output(backend: &mut WaylandBackend) {
         Some((0, 0).into()),
     );
 
-    let guest_scale = crate::core::config::guest_ui_scale(guest_scale_factor);
+    let guest_scale =
+        crate::core::config::guest_ui_scale(guest_scale_factor, window_size.w, window_size.h);
     write_guest_output_state(window_size.w, window_size.h, guest_scale);
 
     for surface in backend.compositor.state.xdg_shell_state.toplevel_surfaces() {

@@ -450,7 +450,8 @@ pub fn handle(event: CentralizedEvent, backend: &mut WaylandBackend, event_loop:
                 );
             }
 
-            let guest_scale = crate::core::config::guest_ui_scale(guest_scale_factor);
+            let guest_scale =
+                crate::core::config::guest_ui_scale(guest_scale_factor, size.w, size.h);
             write_guest_output_state(size.w, size.h, guest_scale);
 
             if let Some(surface) = get_surface(&backend.compositor.state) {
