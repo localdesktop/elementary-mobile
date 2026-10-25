@@ -142,8 +142,6 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
         }
     }
     std::fs::write(gradle.join("gradle.properties"), &gradle_props)?;
-    std::fs::write(gradle.join("settings.gradle"), SETTINGS_GRADLE)?;
-
     let config = env.config().android();
     let mut manifest = config.manifest.clone();
 
@@ -164,6 +162,24 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
     {
         manifest.application.has_code = Some(true);
     }
+
+    let format = env.target().format();
+    let mut asset_packs: Vec<&str> = Vec::new();
+    if format == Format::Aab {
+        for asset in &config.assets {
+            if let Some(pack) = asset.asset_pack() {
+                if !asset_packs.contains(&pack) {
+                    asset_packs.push(pack);
+                }
+            }
+        }
+    }
+    let asset_packs_line = if asset_packs.is_empty() {
+        String::new()
+    } else {
+        let packs: Vec<String> = asset_packs.iter().map(|p| format!("':{}'", p)).collect();
+        format!("assetPacks = [{}]", packs.join(", "))
+    };
 
     let mut dependencies = String::new();
     for dep in &config.dependencies {
@@ -186,6 +202,7 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
                     versionCode {version_code}
                     versionName '{version_name}'
                 }}
+                {asset_packs_line}
                 packagingOptions {{
                     jniLibs {{
                         useLegacyPackaging true
@@ -227,6 +244,7 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
         version_code = version_code,
         version_name = version_name,
         dependencies = dependencies,
+        asset_packs_line = asset_packs_line,
     );
 
     if let Some(icon_path) = env.icon.as_ref() {
@@ -262,6 +280,34 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
     }
 
     std::fs::write(app.join("build.gradle"), app_build_gradle)?;
+
+    let mut settings_gradle = SETTINGS_GRADLE.to_vec();
+    for pack in &asset_packs {
+        settings_gradle.extend_from_slice(format!("include ':{}'\n", pack).as_bytes());
+        let pack_dir = gradle.join(pack);
+        let pack_assets = pack_dir.join("src").join("main").join("assets");
+        if pack_assets.exists() {
+            std::fs::remove_dir_all(&pack_assets)?;
+        }
+        std::fs::create_dir_all(&pack_assets)?;
+        std::fs::write(
+            pack_dir.join("build.gradle"),
+            format!(
+                r#"
+            plugins {{
+                id 'com.android.asset-pack'
+            }}
+            assetPack {{
+                packName = "{pack}"
+                dynamicDelivery {{
+                    deliveryType = "install-time"
+                }}
+            }}
+        "#
+            ),
+        )?;
+    }
+    std::fs::write(gradle.join("settings.gradle"), settings_gradle)?;
     std::fs::write(
         main.join("AndroidManifest.xml"),
         quick_xml::se::to_string(&manifest)?,
@@ -300,7 +346,13 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
                 .path()
                 .file_name()
                 .context("Asset must have file_name component")?;
-            let dest_path = assets.join(file_name);
+            let dest_dir = match asset.asset_pack() {
+                Some(pack) if asset_packs.contains(&pack) => {
+                    gradle.join(pack).join("src").join("main").join("assets")
+                }
+                _ => assets.clone(),
+            };
+            let dest_path = dest_dir.join(file_name);
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -309,7 +361,6 @@ pub fn build(env: &BuildEnv, libraries: Vec<(Target, PathBuf)>, out: &Path) -> R
     }
 
     let opt = env.target().opt();
-    let format = env.target().format();
     let mut cmd = Command::new("gradle");
     cmd.current_dir(&gradle);
     cmd.arg(match format {

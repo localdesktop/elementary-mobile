@@ -31,7 +31,7 @@ userland.
 The OS is never updated in place. A newer APK that carries a different archive replaces the OS on
 its next launch. Your files survive because they are kept outside the OS:
 
-| On the device (`/data/data/app.elementarymobile/files/`) | In elementary OS            |
+| On the device (`/data/data/io.github.localdesktop.pantheon/files/`) | In elementary OS            |
 | -------------------------------------------------------- | --------------------------- |
 | `rootfs/`                                                | `/` (replaced on updates)   |
 | `home/`                                                  | `/home` (kept)              |

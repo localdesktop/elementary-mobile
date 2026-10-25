@@ -366,6 +366,10 @@ pub enum AssetPath {
         optional: bool,
         #[serde(default)]
         alignment: ZipAlignmentOptions,
+        /// In app bundles, ship this file in an install-time asset pack of this name instead of
+        /// the base module, which Google Play limits to 200 MB.
+        #[serde(default)]
+        asset_pack: Option<String>,
     },
 }
 
@@ -391,6 +395,14 @@ impl AssetPath {
         match self {
             AssetPath::Path(_) => Default::default(),
             AssetPath::Extended { alignment, .. } => *alignment,
+        }
+    }
+
+    #[inline]
+    pub fn asset_pack(&self) -> Option<&str> {
+        match self {
+            AssetPath::Path(_) => None,
+            AssetPath::Extended { asset_pack, .. } => asset_pack.as_deref(),
         }
     }
 }

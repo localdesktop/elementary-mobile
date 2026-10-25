@@ -2,9 +2,11 @@ icon: assets/icon.png
 android:
   assets:
     # The bundled OS, built by scripts/build-rootfs.sh. Already compressed, so stored as is: the
-    # app streams it straight out of the APK on first launch.
+    # app streams it straight out of the APK on first launch. App bundles carry it in an
+    # install-time asset pack, as Google Play limits the base module to 200 MB.
     - path: assets/rootfs/elementary-os-rootfs.tar.xz
       alignment: unaligned
+      asset_pack: rootfs
     - assets/rootfs/elementary-os-rootfs.json
     - assets/setup-progress.html
     - assets/unsupported.html
@@ -14,15 +16,15 @@ android:
     - assets/libs
   gradle: true
   manifest:
-    # Different from upstream Local Desktop (app.polarbear) so both can be installed. The Java
+    # Different from upstream Local Desktop (io.github.localdesktop) so both can be installed. The Java
     # service below keeps its app.polarbear class name: JNI symbols in src/android/accessibility.rs
     # are bound to it, and a component's class does not have to match the application ID.
-    package: app.elementarymobile
+    package: io.github.localdesktop.pantheon
     sdk:
-      min_sdk_version: 21
-      target_sdk_version: 33
+      min_sdk_version: 24
+      target_sdk_version: 35
     application:
-      label: "elementary Mobile"
+      label: "Local Desktop: Pantheon"
       theme: "@style/AppTheme"
       extract_native_libs: true # Required for proot invocations
       use_cleartext_traffic: true # Required for connecting to ws://127.0.0.1, see assets/setup-progress.html

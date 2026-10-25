@@ -1,0 +1,64 @@
+name: Upload AAB to Google Play
+run-name: >-
+  ${{ github.event_name == 'release' && github.event.release.name
+      || format('Upload {0} to Google Play', inputs.tag || 'latest release') }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload (empty = latest release)"
+        type: string
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download AAB from release tag
+        if: github.event.release != null || inputs.tag != ''
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.event.release.tag_name || inputs.tag }}
+          fileName: "elementary-mobile-*.aab"
+          out-file-path: "target"
+          extract: false
+
+      - name: Download latest AAB (if manually triggered without a tag)
+        if: github.event.release == null && inputs.tag == ''
+        uses: robinraju/release-downloader@v1
+        with:
+          latest: true
+          fileName: "elementary-mobile-*.aab"
+          out-file-path: "target"
+          extract: false
+
+      - name: Remove debug AABs
+        run: rm -f target/*-debug.aab
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/516615700957/locations/global/workloadIdentityPools/github/providers/github
+          service_account: local-desktop-ci-cd@local-desktop.iam.gserviceaccount.com
+
+      - name: Upload to Google Play (closed track)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: ${{ steps.auth.outputs.credentials_file_path }}
+          packageName: io.github.localdesktop.pantheon
+          releaseFiles: target/*.aab
+          track: alpha
+          status: draft
