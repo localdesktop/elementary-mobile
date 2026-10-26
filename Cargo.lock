@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "localdesktop"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "android-sdkmanager-rs",
  "android_logger",
