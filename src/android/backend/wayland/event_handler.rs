@@ -1,22 +1,25 @@
 use crate::android::{
     accessibility,
+    external_display::{self, PointerEvent},
     backend::wayland::{
         compositor::{send_frames_surface_tree, ClientState, State},
         write_guest_output_state, CentralizedEvent, TouchMode, WaylandBackend,
     },
 };
-use smithay::backend::input::ButtonState;
+use smithay::backend::input::{AxisSource, ButtonState};
 use smithay::backend::renderer::element::surface::{
     render_elements_from_surface_tree, WaylandSurfaceRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::{render_elements, Id, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::utils::draw_render_elements;
+use smithay::backend::renderer::utils::{draw_render_elements, CommitCounter};
 use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer;
+use smithay::input::pointer::{self, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_pointer::ButtonState as WlButtonState;
 use smithay::utils::{Point, Rectangle, Transform, SERIAL_COUNTER};
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use smithay::{
     backend::input::{
@@ -32,6 +35,17 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 const BTN_LEFT: u32 = 0x110;
 /// Linux input event code for the right mouse button (`BTN_RIGHT`).
 const BTN_RIGHT: u32 = 0x111;
+/// Linux input event code for the middle mouse button (`BTN_MIDDLE`).
+const BTN_MIDDLE: u32 = 0x112;
+/// External display pixels the cursor moves per phone pixel the finger moves.
+const TRACKPAD_SPEED: f64 = 1.5;
+/// What the phone shows while it is a trackpad.
+const TRACKPAD_COLOR: Color32F = Color32F::new(0.08, 0.08, 0.08, 1.0);
+const TRACKPAD_GRID_COLOR: Color32F = Color32F::new(0.16, 0.16, 0.16, 1.0);
+/// Marks the trackpad's top edge, which follows the rotate button.
+const TRACKPAD_UP_COLOR: Color32F = Color32F::new(0.24, 0.52, 0.94, 1.0);
+/// Pixels a wheel notch scrolls, as libinput reports for a mouse wheel.
+const WHEEL_STEP: f64 = 15.0;
 
 /**
  * As we currently use Xwayland, there is only 1 surface
@@ -159,6 +173,9 @@ fn poll_long_press(backend: &mut WaylandBackend) {
     }
 
     backend.touch_mode = TouchMode::LongPress;
+    if backend.is_trackpad() {
+        return;
+    }
     // Anchor the pointer where the finger landed, so a drag selects from there.
     emit_pointer_motion(
         &mut backend.compositor,
@@ -268,7 +285,7 @@ pub fn handle(event: CentralizedEvent, backend: &mut WaylandBackend, event_loop:
                             time,
                         ),
                         // A scroll consumed the gesture; nothing to click.
-                        TouchMode::Scroll | TouchMode::Drag => {}
+                        TouchMode::Scroll | TouchMode::Drag | TouchMode::Move => {}
                     }
                 }
             }
@@ -376,6 +393,45 @@ pub fn handle(event: CentralizedEvent, backend: &mut WaylandBackend, event_loop:
             }
             _ => {}
         },
+        CentralizedEvent::TrackpadMotion { dx, dy, time } => {
+            if backend.touch_mode == TouchMode::Drag && !backend.pointer_pressed {
+                emit_pointer_press(&mut backend.compositor, BTN_LEFT, time as u32);
+                backend.pointer_pressed = true;
+            }
+            let size = backend.compositor.state.size;
+            let cursor = &mut backend.cursor_position;
+            cursor.x = (cursor.x + dx * TRACKPAD_SPEED).clamp(0.0, (size.w - 1).max(0) as f64);
+            cursor.y = (cursor.y + dy * TRACKPAD_SPEED).clamp(0.0, (size.h - 1).max(0) as f64);
+            let cursor = backend.cursor_position;
+            emit_pointer_motion(&mut backend.compositor, cursor.x, cursor.y, time as u32);
+        }
+        CentralizedEvent::TrackpadUp {
+            mode,
+            fingers,
+            time,
+        } => {
+            let cursor = backend.cursor_position;
+            if backend.pointer_pressed {
+                emit_pointer_release(&mut backend.compositor, BTN_LEFT, time as u32);
+                backend.pointer_pressed = false;
+                return;
+            }
+            let button = match (mode, fingers) {
+                (TouchMode::Undecided, 1) => BTN_LEFT,
+                (TouchMode::Undecided, 2) | (TouchMode::LongPress, 1) => BTN_RIGHT,
+                (TouchMode::Undecided, _) => BTN_MIDDLE,
+                _ => return,
+            };
+            emit_pointer_click(
+                &mut backend.compositor,
+                button,
+                cursor.x,
+                cursor.y,
+                time as u32,
+            );
+        }
+        // The desktop is on the external display, so the phone's own window doesn't size it.
+        CentralizedEvent::Resized { .. } if backend.is_trackpad() => paint_trackpad(backend),
         CentralizedEvent::Resized {
             size,
             guest_scale_factor,
@@ -405,13 +461,104 @@ pub fn handle(event: CentralizedEvent, backend: &mut WaylandBackend, event_loop:
     }
 }
 
+/// Show the phone's screen as a trackpad: a grid, with its top edge marked.
+pub fn paint_trackpad(backend: &mut WaylandBackend) {
+    let Some(winit) = backend.graphic_renderer.as_mut() else {
+        return;
+    };
+    let size = winit.window_size();
+    if size.w <= 0 || size.h <= 0 {
+        return;
+    }
+    let spacing = (size.w.min(size.h) / 8).max(1);
+    let line = (spacing / 48).max(2);
+    let grid = (1..)
+        .map(|i| i * spacing)
+        .take_while(|x| *x < size.w)
+        .map(|x| Rectangle::new((x, 0).into(), (line, size.h).into()))
+        .chain(
+            (1..)
+                .map(|i| i * spacing)
+                .take_while(|y| *y < size.h)
+                .map(|y| Rectangle::new((0, y).into(), (size.w, line).into())),
+        )
+        .collect();
+    let bar = line * 4;
+    let up = match external_display::trackpad_quarter_turns() {
+        1 => Rectangle::new((0, 0).into(), (bar, size.h).into()),
+        2 => Rectangle::new((0, size.h - bar).into(), (size.w, bar).into()),
+        3 => Rectangle::new((size.w - bar, 0).into(), (bar, size.h).into()),
+        _ => Rectangle::new((0, 0).into(), (size.w, bar).into()),
+    };
+    let layers = [
+        (TRACKPAD_COLOR, vec![Rectangle::from_size(size)]),
+        (TRACKPAD_GRID_COLOR, grid),
+        (TRACKPAD_UP_COLOR, vec![up]),
+    ];
+    if let Err(error) = winit.paint_window(&layers) {
+        log::warn!("Failed to paint the trackpad: {error}");
+    }
+}
+
+/// A mouse on the external display: it points where it is, and its buttons and wheel go
+/// straight to the desktop.
+pub fn on_external_pointer(backend: &mut WaylandBackend, event: PointerEvent) {
+    let time = event.time_ms as u32;
+    let size = backend.compositor.state.size;
+    backend.cursor_position = (
+        event.x.clamp(0.0, (size.w - 1).max(0) as f64),
+        event.y.clamp(0.0, (size.h - 1).max(0) as f64),
+    )
+        .into();
+    let cursor = backend.cursor_position;
+    emit_pointer_motion(&mut backend.compositor, cursor.x, cursor.y, time);
+
+    // `MotionEvent.BUTTON_PRIMARY`, `BUTTON_SECONDARY` and `BUTTON_TERTIARY`.
+    for (mask, button) in [(1, BTN_LEFT), (2, BTN_RIGHT), (4, BTN_MIDDLE)] {
+        let was = backend.external_buttons & mask != 0;
+        let is = event.buttons & mask != 0;
+        if is && !was {
+            emit_pointer_press(&mut backend.compositor, button, time);
+        } else if was && !is {
+            emit_pointer_release(&mut backend.compositor, button, time);
+        }
+    }
+    backend.external_buttons = event.buttons;
+
+    if event.scroll_x != 0.0 || event.scroll_y != 0.0 {
+        // Android scrolls up and left with positive values, Wayland down and right.
+        let mut frame = pointer::AxisFrame::new(time).source(AxisSource::Wheel);
+        if event.scroll_x != 0.0 {
+            frame = frame
+                .value(Axis::Horizontal, event.scroll_x * WHEEL_STEP)
+                .v120(Axis::Horizontal, (event.scroll_x * 120.0) as i32);
+        }
+        if event.scroll_y != 0.0 {
+            frame = frame
+                .value(Axis::Vertical, -event.scroll_y * WHEEL_STEP)
+                .v120(Axis::Vertical, (-event.scroll_y * 120.0) as i32);
+        }
+        let compositor = &mut backend.compositor;
+        let pointer = compositor.pointer.clone();
+        pointer.axis(&mut compositor.state, frame);
+        pointer.frame(&mut compositor.state);
+    }
+}
+
+render_elements! {
+    SurfaceElement<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Solid=SolidColorRenderElement,
+}
+
 fn redraw(backend: &mut WaylandBackend) -> Result<(), String> {
     let Some(winit) = backend.graphic_renderer.as_mut() else {
         return Ok(());
     };
 
-    let size = winit.window_size();
+    let size = winit.output_size();
     let damage = Rectangle::from_size(size);
+    let trackpad = winit.external_surface().is_some();
     {
         let (renderer, mut framebuffer) = winit
             .bind()
@@ -419,13 +566,48 @@ fn redraw(backend: &mut WaylandBackend) -> Result<(), String> {
 
         let compositor = &mut backend.compositor;
 
-        let elements = compositor
-            .state
-            .xdg_shell_state
-            .toplevel_surfaces()
-            .iter()
-            .flat_map(|surface| {
-                render_elements_from_surface_tree(
+        // Elements are drawn front to back, so the cursor goes first.
+        let mut elements = Vec::new();
+        if trackpad {
+            let position = backend.cursor_position.to_physical(1.0).to_i32_round();
+            match &compositor.state.cursor_image {
+                CursorImageStatus::Surface(surface) => {
+                    let hotspot = with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<CursorImageSurfaceData>()
+                            .map(|data| data.lock().unwrap().hotspot)
+                    })
+                    .unwrap_or_default();
+                    elements.extend(
+                        render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
+                            renderer,
+                            surface,
+                            position - hotspot.to_physical(1),
+                            1.0,
+                            1.0,
+                            Kind::Cursor,
+                        )
+                        .into_iter()
+                        .map(SurfaceElement::Surface),
+                    );
+                }
+                // The client didn't provide an image; a small square at least shows where it is.
+                CursorImageStatus::Named(_) => {
+                    elements.push(SurfaceElement::Solid(SolidColorRenderElement::new(
+                        Id::new(),
+                        Rectangle::new(position, (8, 8).into()),
+                        CommitCounter::default(),
+                        Color32F::new(1.0, 1.0, 1.0, 1.0),
+                        Kind::Cursor,
+                    )));
+                }
+                CursorImageStatus::Hidden => {}
+            }
+        }
+        for surface in compositor.state.xdg_shell_state.toplevel_surfaces() {
+            elements.extend(
+                render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
                     renderer,
                     surface.wl_surface(),
                     (0, 0),
@@ -433,8 +615,10 @@ fn redraw(backend: &mut WaylandBackend) -> Result<(), String> {
                     1.0,
                     Kind::Unspecified,
                 )
-            })
-            .collect::<Vec<WaylandSurfaceRenderElement<GlesRenderer>>>();
+                .into_iter()
+                .map(SurfaceElement::Surface),
+            );
+        }
 
         let mut frame = renderer
             .render(&mut framebuffer, size, Transform::Flipped180)
@@ -449,11 +633,12 @@ fn redraw(backend: &mut WaylandBackend) -> Result<(), String> {
             .finish()
             .map_err(|error| format!("Failed to finish frame: {error:?}"))?;
 
+        let time = compositor.start_time.elapsed().as_millis() as u32;
         for surface in compositor.state.xdg_shell_state.toplevel_surfaces() {
-            send_frames_surface_tree(
-                surface.wl_surface(),
-                compositor.start_time.elapsed().as_millis() as u32,
-            );
+            send_frames_surface_tree(surface.wl_surface(), time);
+        }
+        if let CursorImageStatus::Surface(surface) = &compositor.state.cursor_image {
+            send_frames_surface_tree(surface, time);
         }
 
         match compositor.listener.accept() {

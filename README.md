@@ -12,6 +12,10 @@ Wayland compositor in the Android NDK plus proot) and replaces what runs on it.
 ideally with a keyboard and mouse. It brings a desktop to Android; it does not turn the desktop
 into a phone UI.
 
+On a phone, connect a monitor (USB-C to HDMI, a dock, or a wireless display): the desktop moves
+to it and the phone becomes a trackpad, with buttons to turn the trackpad and to type with the
+Android keyboard.
+
 ## How it works
 
 1. The APK carries an elementary OS 8 root filesystem as a ~190 MB xz archive

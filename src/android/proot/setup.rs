@@ -434,6 +434,9 @@ pub fn build_wayland_backend(android_app: AndroidApp) -> WaylandBackend {
         touch_slop_px: touch_slop_px(&android_app),
         long_press_timeout_ms: long_press_timeout_ms(&android_app),
         pointer_pressed: false,
+        touch_fingers: 0,
+        cursor_position: (0.0, 0.0).into(),
+        external_buttons: 0,
         android_app,
     }
 }
