@@ -13,8 +13,10 @@ ideally with a keyboard and mouse. It brings a desktop to Android; it does not t
 into a phone UI.
 
 On a phone, connect a monitor (USB-C to HDMI, a dock, or a wireless display): the desktop moves
-to it and the phone becomes a trackpad, with buttons to turn the trackpad and to type with the
+to it and the phone becomes a trackpad, with buttons to turn the screen and to type with the
 Android keyboard.
+
+<img src="docs/img/external-display-monitor.jpg" width="560" alt="elementary OS on a 4K monitor"> <img src="docs/img/external-display-trackpad.png" width="120" alt="The phone as its trackpad">
 
 ## How it works
 
