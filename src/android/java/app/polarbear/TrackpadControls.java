@@ -275,6 +275,11 @@ final class TrackpadControls extends Dialog implements InputManager.InputDeviceL
         return true;
     }
 
+    /** A text field on the desktop took focus. */
+    void showKeyboard() {
+        setKeyboardShown(true);
+    }
+
     /**
      * Turns the whole screen a quarter clockwise, Android keyboard included, for a phone lying
      * sideways while auto-rotate keeps it upright.

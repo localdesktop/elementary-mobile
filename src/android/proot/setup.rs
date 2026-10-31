@@ -364,6 +364,87 @@ fn replace_file(path: &Path, contents: &str) {
     }
 }
 
+/// Apps report focused text fields over the accessibility bus (AT-SPI): the app opens the Android
+/// keyboard when one takes focus. Every launch, so updates reach existing installs.
+fn setup_keyboard(_: &SetupOptions) -> StageOutput {
+    let rootfs = get_application_context().rootfs_dir;
+    let script = rootfs.join("usr/local/bin/elementary-mobile-keyboard");
+    replace_file(
+        &script,
+        r#"#!/usr/bin/python3
+# Ask the app for the Android keyboard (see external_display.rs) when a text field takes focus.
+import os, pyatspi
+
+REQUEST = "/tmp/localdesktop-keyboard"
+
+def on_focus(event):
+    if not event.detail1:
+        return
+    try:
+        editable = event.source.getState().contains(pyatspi.STATE_EDITABLE)
+        # Its terminal widget doesn't report itself as one.
+        terminal = event.source.getApplication().name == "io.elementary.terminal"
+    except Exception:
+        return
+    if editable or terminal:
+        with open(REQUEST, "a"):
+            os.utime(REQUEST)
+
+pyatspi.Registry.registerEventListener(on_focus, "object:state-changed:focused")
+pyatspi.Registry.start()
+"#,
+    );
+    let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
+    replace_file(
+        &rootfs.join("etc/elementary-mobile/xdg/autostart/elementary-mobile-keyboard.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Android keyboard\nExec=/usr/local/bin/elementary-mobile-keyboard\nNoDisplay=true\n",
+    );
+    // For text fields the listener misses.
+    let applications = rootfs.join("usr/local/share/applications");
+    let _ = fs::create_dir_all(&applications);
+    replace_file(
+        &applications.join("elementary-mobile-keyboard.desktop"),
+        "[Desktop Entry]\nType=Application\nName=On-screen keyboard\nComment=Show the Android keyboard\nExec=touch /tmp/localdesktop-keyboard\nIcon=input-keyboard\nCategories=Utility;Accessibility;\n",
+    );
+    None
+}
+
+/// The accessibility bus for `setup_keyboard`, on an OS unpacked before it came with it.
+fn setup_keyboard_packages(options: &SetupOptions) -> StageOutput {
+    let rootfs = get_application_context().rootfs_dir;
+    let installed = [
+        "usr/libexec/at-spi-bus-launcher",
+        "usr/lib/python3/dist-packages/pyatspi",
+    ];
+    if installed.iter().all(|path| rootfs.join(path).exists()) {
+        return None;
+    }
+    let mpsc_sender = options.mpsc_sender.clone();
+    Some(thread::spawn(move || {
+        mpsc_sender
+            .send(SetupMessage::Progress(
+                "Installing the Android keyboard helper...".to_string(),
+            ))
+            .unwrap_or(());
+        let packages = "at-spi2-core python3-pyatspi gir1.2-atspi-2.0";
+        let output = GuestProcess {
+            command: format!(
+                "export DEBIAN_FRONTEND=noninteractive; apt-get install -y --no-install-recommends {packages} || {{ apt-get update && apt-get install -y --no-install-recommends {packages}; }}"
+            ),
+            user: None,
+            log: None,
+        }
+        .run();
+        if !output.status.success() {
+            // Offline: the next launch tries again.
+            log::warn!(
+                "Failed to install {packages}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }))
+}
+
 /// The DNS servers of Android's active network, as IP address strings.
 fn android_dns_servers(android_app: &AndroidApp) -> Vec<String> {
     fn query(env: &mut jni::JNIEnv, app: &AndroidApp) -> Option<Vec<String>> {
@@ -490,6 +571,7 @@ pub fn build_wayland_backend(android_app: AndroidApp) -> WaylandBackend {
         touch_fingers: 0,
         cursor_position: (0.0, 0.0).into(),
         external_buttons: 0,
+        keyboard_inset: 0,
         android_app,
     }
 }
@@ -543,6 +625,8 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
         Box::new(setup_network_and_time),       // Step 5. DNS servers and timezone from Android
         Box::new(setup_cpuinfo),                // Step 6. /proc/cpuinfo that llvmpipe can trust
         Box::new(fix_xkb_symlink),              // Step 7. Fix xkb symlink
+        Box::new(setup_keyboard),               // Step 8. Android keyboard for focused text fields
+        Box::new(setup_keyboard_packages),      // Step 8b. Its accessibility bus on older installs
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {

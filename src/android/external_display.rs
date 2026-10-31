@@ -1,8 +1,10 @@
 use std::{
     collections::VecDeque,
     ffi::c_void,
+    fs,
     ptr::NonNull,
     sync::{Arc, Condvar, Mutex, OnceLock},
+    thread,
     time::Duration,
 };
 
@@ -20,6 +22,7 @@ use winit::{
 use crate::android::{
     accessibility::{self, AppUserEvent},
     backend::wayland::physicalkey_to_scancode,
+    utils::application_context::get_application_context,
 };
 
 #[repr(C)]
@@ -83,16 +86,40 @@ struct Bridge {
     /// The event loop holds an EGL surface on `surface`.
     in_use: bool,
     pointer_events: VecDeque<PointerEvent>,
+    /// How much of the phone's screen the Android keyboard covers, in pixels.
+    keyboard_inset: i32,
 }
 
 static BRIDGE: OnceLock<(Mutex<Bridge>, Condvar)> = OnceLock::new();
+
+/// The guest touches this when a text field takes focus (see `elementary-mobile-keyboard`).
+const KEYBOARD_REQUEST: &str = "tmp/localdesktop-keyboard";
 
 fn bridge() -> &'static (Mutex<Bridge>, Condvar) {
     BRIDGE.get_or_init(Default::default)
 }
 
 pub fn register_event_loop_proxy(proxy: EventLoopProxy<AppUserEvent>) {
-    bridge().0.lock().unwrap().proxy = Some(proxy);
+    bridge().0.lock().unwrap().proxy = Some(proxy.clone());
+    watch_keyboard_requests(proxy);
+}
+
+fn watch_keyboard_requests(proxy: EventLoopProxy<AppUserEvent>) {
+    thread::spawn(move || {
+        let path = get_application_context().rootfs_dir.join(KEYBOARD_REQUEST);
+        let modified = || fs::metadata(&path).and_then(|it| it.modified()).ok();
+        let mut last = modified();
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let now = modified();
+            if now != last {
+                last = now;
+                if now.is_some() && proxy.send_event(AppUserEvent::KeyboardRequested).is_err() {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// The external monitor's surface, if one is connected.
@@ -107,6 +134,10 @@ pub fn set_in_use(in_use: bool) {
     if !in_use {
         released.notify_all();
     }
+}
+
+pub fn keyboard_inset() -> i32 {
+    bridge().0.lock().unwrap().keyboard_inset
 }
 
 pub fn drain_pointer_events() -> Vec<PointerEvent> {
@@ -164,6 +195,11 @@ fn call_java(env: &mut JNIEnv, android_app: &AndroidApp, method: &str) {
 /// Start showing the desktop on an external monitor whenever one is connected.
 pub fn start(env: &mut JNIEnv, android_app: &AndroidApp) {
     call_java(env, android_app, "start");
+}
+
+/// Open the Android keyboard, over the trackpad or on the phone's screen.
+pub fn show_keyboard(env: &mut JNIEnv, android_app: &AndroidApp) {
+    call_java(env, android_app, "showKeyboard");
 }
 
 /// Keep the desktop on the monitor while the app is in the background.
@@ -294,4 +330,17 @@ pub extern "system" fn Java_app_polarbear_TrackpadControls_nativeOnKey(
         ElementState::Released
     };
     accessibility::inject_key(scancode, state, event_time_ms.max(0) as u64);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_polarbear_PhoneKeyboard_nativeOnInset(
+    _env: JNIEnv,
+    _class: JClass,
+    bottom: jint,
+) {
+    let mut bridge = bridge().0.lock().unwrap();
+    if bridge.keyboard_inset != bottom {
+        bridge.keyboard_inset = bottom;
+        notify(&bridge, AppUserEvent::KeyboardInset);
+    }
 }
