@@ -30,6 +30,10 @@ const STAMP_FILE: &str = ".elementary-mobile-rootfs";
 /// Suffix of the directory an archive is unpacked into before it is moved into place.
 const PARTIAL_SUFFIX: &str = "partial";
 
+/// File inside a root filesystem whose setuid programs (sudo, su, passwd) have their proot
+/// metadata. Root filesystems unpacked before it existed get it from `restore_setuid_metadata`.
+const SETUID_STAMP: &str = ".elementary-mobile-setuid";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RootfsManifest {
     /// SHA-256 of the archive. Changes whenever the bundled OS does.
@@ -113,6 +117,7 @@ pub fn install<R: Read>(
             }
             _ => {
                 entry.unpack_in(&partial)?;
+                write_setuid_metadata(&partial, &entry)?;
                 // The guest runs as a fake root that should be able to change any file, but the
                 // kernel still checks the owner bits of the app's own user.
                 if kind == EntryType::Regular && mode & 0o600 != 0o600 {
@@ -135,7 +140,54 @@ pub fn install<R: Read>(
     progress(read_bytes.get());
 
     fs::write(partial.join(STAMP_FILE), &manifest.id)?;
+    fs::write(partial.join(SETUID_STAMP), "")?;
     fs::rename(&partial, rootfs)
+}
+
+/// Whether `rootfs` was unpacked before setuid programs got their proot metadata.
+pub fn needs_setuid_metadata(rootfs: &Path) -> bool {
+    rootfs.join(STAMP_FILE).exists() && !rootfs.join(SETUID_STAMP).exists()
+}
+
+/// Give the setuid programs of an already unpacked `rootfs` their proot metadata, reading
+/// `archive` (the one it was unpacked from) without unpacking it again.
+pub fn restore_setuid_metadata<R: Read>(
+    archive: R,
+    rootfs: &Path,
+    mut progress: impl FnMut(u64),
+) -> io::Result<()> {
+    let read_bytes = Rc::new(Cell::new(0u64));
+    let reader = CountingReader {
+        inner: XzDecoder::new(archive),
+        count: read_bytes.clone(),
+    };
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries()? {
+        write_setuid_metadata(rootfs, &entry?)?;
+        progress(read_bytes.get());
+    }
+    fs::write(rootfs.join(SETUID_STAMP), "")
+}
+
+/// Android does not let apps set the setuid bit or change owners, so proot's fake root keeps them
+/// in a `.proot-meta-file.<name>.meta` file next to the file. Without it, sudo and su run as the
+/// user who started them and cannot become root.
+fn write_setuid_metadata<R: Read>(root: &Path, entry: &tar::Entry<R>) -> io::Result<()> {
+    let header = entry.header();
+    let mode = header.mode().unwrap_or(0);
+    if header.entry_type() != EntryType::Regular || mode & 0o6000 == 0 {
+        return Ok(());
+    }
+    let Some(dst) = destination(root, &entry.path()?) else {
+        return Ok(());
+    };
+    let (Some(dir), Some(name)) = (dst.parent(), dst.file_name()) else {
+        return Ok(());
+    };
+    let meta = dir.join(format!(".proot-meta-file.{}.meta", name.to_string_lossy()));
+    let (uid, gid) = (header.uid().unwrap_or(0), header.gid().unwrap_or(0));
+    // proot reads the mode as octal digits written in decimal.
+    fs::write(meta, format!("{:o}\n{uid}\n{gid}\n", mode & 0o7777))
 }
 
 /// Remove what an interrupted `install` left behind. Cheap when there is nothing to clean up.

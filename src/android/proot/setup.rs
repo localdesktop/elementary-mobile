@@ -142,6 +142,45 @@ fn setup_rootfs(options: &SetupOptions) -> StageOutput {
     }))
 }
 
+/// Root filesystems unpacked before setuid programs kept their proot metadata: read the archive
+/// once more to give sudo, su and passwd back their setuid bit, without unpacking it again.
+fn setup_setuid_metadata(options: &SetupOptions) -> StageOutput {
+    let rootfs_dir = get_application_context().rootfs_dir;
+    if !rootfs::needs_setuid_metadata(&rootfs_dir) {
+        return None;
+    }
+
+    let android_app = options.android_app.clone();
+    let mpsc_sender = options.mpsc_sender.clone();
+    let total = options.manifest.uncompressed_size.max(1);
+    Some(thread::spawn(move || {
+        let name = CString::new(ROOTFS_ARCHIVE).expect("asset name has no NUL bytes");
+        let Some(asset) = android_app.asset_manager().open(&name) else {
+            log::error!("This APK does not contain {ROOTFS_ARCHIVE}");
+            return;
+        };
+        let mut last_percent = None;
+        let result = rootfs::restore_setuid_metadata(
+            BufReader::with_capacity(1 << 20, asset),
+            &rootfs_dir,
+            |read| {
+                let percent = (read * 100 / total).min(100);
+                if last_percent != Some(percent) {
+                    last_percent = Some(percent);
+                    mpsc_sender
+                        .send(SetupMessage::Progress(format!(
+                            "Setting up sudo... {percent}%"
+                        )))
+                        .unwrap_or(());
+                }
+            },
+        );
+        if let Err(error) = result {
+            log::error!("Failed to restore setuid programs: {error}");
+        }
+    }))
+}
+
 fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
     let fs_root = get_application_context().rootfs_dir;
     let mpsc_sender = options.mpsc_sender.clone();
@@ -497,6 +536,7 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
 
     let stages: Vec<SetupStage> = vec![
         Box::new(setup_rootfs),                 // Step 1. Unpack the OS bundled in the APK
+        Box::new(setup_setuid_metadata),        // Step 1b. sudo for an OS unpacked by an older version
         Box::new(simulate_linux_sysdata_stage), // Step 2. Simulate Linux system data
         Box::new(setup_home),                   // Step 3. Persistent /home and /etc/localdesktop
         Box::new(setup_machine_id),             // Step 4. Seed /etc/machine-id for D-Bus clients
