@@ -9,7 +9,8 @@ use crate::android::{
         pipewire_standalone_aaudio,
         wayland::{
             bind, centralize, centralize_injected_keyboard, handle, on_external_pointer,
-            paint_trackpad, write_guest_output_state, CentralizedEvent, State, WaylandBackend,
+            paint_trackpad, set_keyboard_inset, write_guest_output_state, CentralizedEvent, State,
+            WaylandBackend,
         },
         webview::ErrorVariant,
     },
@@ -235,6 +236,17 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                 for event in external_display::drain_pointer_events() {
                     on_external_pointer(backend, event);
                 }
+            }
+            AppUserEvent::KeyboardRequested => {
+                if backend.window_visible() {
+                    run_in_jvm(
+                        external_display::show_keyboard,
+                        self.frontend.android_app.clone(),
+                    );
+                }
+            }
+            AppUserEvent::KeyboardInset => {
+                set_keyboard_inset(backend, external_display::keyboard_inset());
             }
             _ => {
                 for event in accessibility::drain_pending_events() {

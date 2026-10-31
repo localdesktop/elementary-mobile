@@ -12,6 +12,9 @@ Wayland compositor in the Android NDK plus proot) and replaces what runs on it.
 ideally with a keyboard and mouse. It brings a desktop to Android; it does not turn the desktop
 into a phone UI.
 
+Tap a text field and your phone's own keyboard comes up, with the desktop fitting above it. For
+apps where it doesn't, open **On-screen keyboard** from the Applications menu.
+
 On a phone, connect a monitor (USB-C to HDMI, a dock, or a wireless display): the desktop moves
 to it and the phone becomes a trackpad, with buttons to turn the screen and to type with the
 Android keyboard.

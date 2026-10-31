@@ -12,7 +12,7 @@ pub use output_state::write_guest_output_state;
 
 pub use compositor::{Compositor, State};
 pub use event_centralizer::{centralize, centralize_injected_keyboard, CentralizedEvent};
-pub use event_handler::{handle, on_external_pointer, paint_trackpad};
+pub use event_handler::{handle, on_external_pointer, paint_trackpad, set_keyboard_inset};
 pub use winit_backend::{bind, WinitGraphicsBackend};
 
 use smithay::{
@@ -67,6 +67,8 @@ pub struct WaylandBackend {
     pub cursor_position: Point<f64, Logical>,
     /// Buttons held by a mouse on the external display (`MotionEvent.getButtonState()`).
     pub external_buttons: i32,
+    /// How much of the bottom of the phone's screen the Android keyboard covers, in pixels.
+    pub keyboard_inset: i32,
 }
 
 impl WaylandBackend {

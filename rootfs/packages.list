@@ -73,6 +73,10 @@ file-roller
 
 # On-screen keyboard (toggled from Quick Settings for touch-only use)
 onboard
+# Reports focused text fields, so the app can open the Android keyboard
+at-spi2-core
+gir1.2-atspi-2.0
+python3-pyatspi
 
 # Command-line basics
 ca-certificates
