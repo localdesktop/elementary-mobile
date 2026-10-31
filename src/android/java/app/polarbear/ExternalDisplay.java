@@ -3,6 +3,7 @@ package app.polarbear;
 import android.app.Activity;
 import android.app.Presentation;
 import android.content.Context;
+import android.content.pm.ActivityInfo;
 import android.hardware.display.DisplayManager;
 import android.os.Bundle;
 import android.os.Handler;
@@ -122,6 +123,10 @@ public final class ExternalDisplay {
         if (controls != null) {
             controls.dismiss();
             controls = null;
+        }
+        if (activity != null) {
+            // The rotate button may have turned the screen; follow the phone again.
+            activity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
         }
         if (presentation != null) {
             presentation.dismiss();

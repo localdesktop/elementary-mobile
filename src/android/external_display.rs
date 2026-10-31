@@ -2,10 +2,7 @@ use std::{
     collections::VecDeque,
     ffi::c_void,
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, Condvar, Mutex, OnceLock,
-    },
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -87,13 +84,6 @@ struct Bridge {
 }
 
 static BRIDGE: OnceLock<(Mutex<Bridge>, Condvar)> = OnceLock::new();
-
-/// How many quarter turns clockwise the phone lies from how Android draws it.
-static TRACKPAD_QUARTER_TURNS: AtomicU8 = AtomicU8::new(0);
-
-pub fn trackpad_quarter_turns() -> u8 {
-    TRACKPAD_QUARTER_TURNS.load(Ordering::Relaxed)
-}
 
 fn bridge() -> &'static (Mutex<Bridge>, Condvar) {
     BRIDGE.get_or_init(Default::default)
@@ -228,16 +218,6 @@ pub extern "system" fn Java_app_polarbear_ExternalDisplay_nativeSurfaceDestroyed
     if timeout.timed_out() {
         log::warn!("Timed out waiting for the renderer to release the external display");
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_app_polarbear_TrackpadControls_nativeSetQuarterTurns(
-    _env: JNIEnv,
-    _class: JClass,
-    quarter_turns: jint,
-) {
-    TRACKPAD_QUARTER_TURNS.store(quarter_turns.rem_euclid(4) as u8, Ordering::Relaxed);
-    notify(&bridge().0.lock().unwrap(), AppUserEvent::TrackpadRotated);
 }
 
 #[no_mangle]

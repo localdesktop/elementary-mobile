@@ -211,8 +211,9 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                     |env, _| close_webview_popups(env),
                     self.frontend.android_app.clone(),
                 );
-                self.backend =
-                    PolarBearBackend::Wayland(build_wayland_backend(self.frontend.android_app.clone()));
+                self.backend = PolarBearBackend::Wayland(build_wayland_backend(
+                    self.frontend.android_app.clone(),
+                ));
                 // Same as coming back to the app: bind the renderer and start the session. If the
                 // app is in the background, this fails quietly and the next resume does it.
                 self.resumed(event_loop);
@@ -233,11 +234,6 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
             AppUserEvent::ExternalPointer => {
                 for event in external_display::drain_pointer_events() {
                     on_external_pointer(backend, event);
-                }
-            }
-            AppUserEvent::TrackpadRotated => {
-                if backend.is_trackpad() {
-                    paint_trackpad(backend);
                 }
             }
             _ => {
