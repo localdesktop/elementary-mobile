@@ -137,10 +137,7 @@ impl GuestProcess {
             .arg("--bind=/dev/tty:/dev/tty")
             // User data and settings live outside the OS so that an update replacing it keeps them.
             .arg(format!("--bind={}:/home", context.home_dir.display()))
-            .arg(format!(
-                "--bind={}:/etc/localdesktop",
-                context.config_dir.display()
-            ));
+            .arg(format!("--bind={}:/etc/localdesktop", context.config_dir.display()));
 
         if context.permission_all_files_access {
             process
@@ -181,7 +178,7 @@ impl GuestProcess {
             .arg(format!("USER={}", user))
             .arg(format!("LOGNAME={}", user));
         // See `core::cpuinfo`: llvmpipe's optimised shaders still crash Gala on these devices.
-        if !kernel_enables_sve(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()) {
+        if !kernel_enables_sve(&fs::read_to_string("/proc/cpuinfo").unwrap_or_default()) {
             process.arg("GALLIVM_PERF=nopt");
         }
 
