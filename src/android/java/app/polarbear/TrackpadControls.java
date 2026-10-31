@@ -7,7 +7,9 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.drawable.AdaptiveIconDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.Build;
@@ -236,8 +238,12 @@ final class TrackpadControls extends Dialog {
         PadView(Context context) {
             super(context);
             paint.setStyle(Paint.Style.STROKE);
-            // The launcher icon as it is: the bear on its blue background.
-            logo = context.getApplicationInfo().loadIcon(context.getPackageManager());
+            Drawable icon = context.getApplicationInfo().loadIcon(context.getPackageManager());
+            // The whole picture: a launcher would crop the edges of this full-bleed layer.
+            if (Build.VERSION.SDK_INT >= 26 && icon instanceof AdaptiveIconDrawable) {
+                icon = ((AdaptiveIconDrawable) icon).getForeground();
+            }
+            logo = icon;
         }
 
         @Override
@@ -264,8 +270,14 @@ final class TrackpadControls extends Dialog {
             paint.setColor(Color.BLACK);
             canvas.drawRect(left, top, left + size, top + size, paint);
             paint.setStyle(Paint.Style.STROKE);
+            canvas.save();
+            Path corners = new Path();
+            corners.addRoundRect(new RectF(left, top, left + size, top + size),
+                    size * 0.22f, size * 0.22f, Path.Direction.CW);
+            canvas.clipPath(corners);
             logo.setBounds(left, top, left + size, top + size);
             logo.draw(canvas);
+            canvas.restore();
         }
     }
 
