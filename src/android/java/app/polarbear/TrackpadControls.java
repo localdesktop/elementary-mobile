@@ -7,7 +7,7 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
-import android.graphics.Path;
+import android.graphics.PorterDuff;
 import android.graphics.RectF;
 import android.graphics.drawable.AdaptiveIconDrawable;
 import android.graphics.drawable.ColorDrawable;
@@ -234,16 +234,24 @@ final class TrackpadControls extends Dialog {
     private static final class PadView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Drawable logo;
+        /** `logo` is an adaptive icon layer, with the art in its middle two thirds. */
+        private final boolean logoIsLayer;
 
         PadView(Context context) {
             super(context);
             paint.setStyle(Paint.Style.STROKE);
             Drawable icon = context.getApplicationInfo().loadIcon(context.getPackageManager());
-            // The whole picture: a launcher would crop the edges of this full-bleed layer.
-            if (Build.VERSION.SDK_INT >= 26 && icon instanceof AdaptiveIconDrawable) {
-                icon = ((AdaptiveIconDrawable) icon).getForeground();
+            if (Build.VERSION.SDK_INT >= 33 && icon instanceof AdaptiveIconDrawable
+                    && ((AdaptiveIconDrawable) icon).getMonochrome() != null) {
+                // The silhouette, in the pad's grey.
+                logo = ((AdaptiveIconDrawable) icon).getMonochrome().mutate();
+                logo.setColorFilter(0xFF8A8A8A, PorterDuff.Mode.SRC_IN);
+                logoIsLayer = true;
+            } else {
+                // An icon without one (a full-bleed picture) as the launcher shows it.
+                logo = icon;
+                logoIsLayer = false;
             }
-            logo = icon;
         }
 
         @Override
@@ -270,14 +278,9 @@ final class TrackpadControls extends Dialog {
             paint.setColor(Color.BLACK);
             canvas.drawRect(left, top, left + size, top + size, paint);
             paint.setStyle(Paint.Style.STROKE);
-            canvas.save();
-            Path corners = new Path();
-            corners.addRoundRect(new RectF(left, top, left + size, top + size),
-                    size * 0.22f, size * 0.22f, Path.Direction.CW);
-            canvas.clipPath(corners);
-            logo.setBounds(left, top, left + size, top + size);
+            int bleed = logoIsLayer ? size / 4 : 0;
+            logo.setBounds(left - bleed, top - bleed, left + size + bleed, top + size + bleed);
             logo.draw(canvas);
-            canvas.restore();
         }
     }
 
