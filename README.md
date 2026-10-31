@@ -12,6 +12,12 @@ Wayland compositor in the Android NDK plus proot) and replaces what runs on it.
 ideally with a keyboard and mouse. It brings a desktop to Android; it does not turn the desktop
 into a phone UI.
 
+On a phone, connect a monitor (USB-C to HDMI, a dock, or a wireless display): the desktop moves
+to it and the phone becomes a trackpad, with buttons to turn the screen and to type with the
+Android keyboard.
+
+<img src="docs/img/external-display-monitor.jpg" width="560" alt="elementary OS on a 4K monitor"> <img src="docs/img/external-display-trackpad.png" width="120" alt="The phone as its trackpad">
+
 ## How it works
 
 1. The APK carries an elementary OS 8 root filesystem as a ~190 MB xz archive
@@ -24,7 +30,13 @@ into a phone UI.
    Classic session inside it: Wingpanel, the Dock, notifications and the apps.
 
 Rendering is done on the CPU (Mesa llvmpipe): Android's GPU drivers cannot be used from a glibc
-userland.
+userland. llvmpipe compiles shaders for the CPU it reads from `/proc/cpuinfo`; on phones whose
+firmware turns off SVE (Snapdragon 8 Gen 1 to 3, for example) the app hides the CPU model from the
+guest, or Gala would crash on the first shader that uses it.
+
+The desktop's scale follows Android's display density, lowered when the desktop would otherwise be
+smaller than 540×900 logical pixels (but never below half the size of Android's own UI): a 520 dpi
+foldable gets 2x on both its screens instead of 3x.
 
 ### Updates
 
@@ -61,7 +73,7 @@ Crash reporting is off. Set `SENTRY_DSN` when building to send crashes to your o
 Android 12 and later kill an app's child processes once it has more than 32 of them (the "phantom
 process killer"); everything in the desktop then disappears at once. The session is trimmed to
 about 23 processes at idle, which leaves room for a couple of apps (Terminal and Web together use
-6). To open more at the same time, lift the limit once:
+7). To open more at the same time, lift the limit once:
 
 - Android 14 and later: Developer options → **Disable child process restrictions**.
 - Otherwise, from a computer with adb:
@@ -81,8 +93,8 @@ about 23 processes at idle, which leaves room for a couple of apps (Terminal and
   managed by Android. Screen locking is too.
 - Translations are stripped to keep the APK small, so the desktop is in English.
 - Shut down and restart in the session menu (there is no logind). Log out starts a fresh session.
-- Known rough edges: the panel and dock sometimes appear only after the first tap, and sound is
-  not working reliably yet.
+- Known rough edges: sound is not working reliably yet, and on narrow screens (a foldable's cover
+  screen) some windows open wider than the screen.
 
 ## Building
 

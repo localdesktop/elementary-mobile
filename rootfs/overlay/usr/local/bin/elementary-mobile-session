@@ -84,8 +84,30 @@ export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=cairo
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 ELECTRON_DISABLE_SANDBOX=1
 export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
 # Android kills apps with more than 32 child processes, so the session avoids helper processes:
-# a forked bus instead of dbus-run-session, and Gala started directly rather than supervised.
+# a forked bus instead of dbus-run-session, and one shell that keeps Gala running.
 bus_pid_file="$XDG_RUNTIME_DIR/session-bus.pid"
+
+# What Gala starts and leaves behind when it dies. A new Gala starts them again, and Wingpanel and
+# the Dock refuse to run twice, so it would keep restarting them every second.
+gala_helpers='(/usr/libexec/)?(io\.elementary\.(wingpanel|dock|notifications)|gala-daemon-gtk3|mutter-x11-frames)'
+
+# Gala runs outside gnome-session: it reports readiness to systemd only, so as a session component
+# it would hit gnome-session's registration timeout. Its screen locker also crashes without
+# XDG_SESSION_ID when logind is missing. Without a window manager the screen goes black and stops
+# responding, so it is started again if it dies.
+run_gala() {
+    trap 'kill "$wm" 2>/dev/null; wait "$wm"; exit' TERM
+    while :; do
+        started=$(date +%s)
+        XDG_SESSION_ID=elementary-mobile gala &
+        wm=$!
+        wait "$wm"
+        log "Gala exited with status $?, restarting it"
+        pkill -x -f "$gala_helpers"
+        # Do not spin if it cannot start at all.
+        [ $(($(date +%s) - started)) -ge 10 ] || sleep 10
+    done
+}
 
 # Start a fresh session after "Log Out", like a display manager with automatic login.
 while kill -0 "$xwayland" 2>/dev/null; do
@@ -94,10 +116,7 @@ while kill -0 "$xwayland" 2>/dev/null; do
 
     gsettings set org.gnome.desktop.interface scaling-factor "$scale"
 
-    # Gala runs outside gnome-session: it reports readiness to systemd only, so as a session
-    # component it would hit gnome-session's registration timeout. Its screen locker also crashes
-    # without XDG_SESSION_ID when logind is missing.
-    XDG_SESSION_ID=elementary-mobile gala &
+    run_gala &
     gala=$!
 
     gnome-session --session=elementary-mobile

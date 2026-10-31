@@ -57,7 +57,9 @@ The stages, in order:
    `/etc/localdesktop`, so they survive OS updates) and seed the user's home directory.
 4. `setup_machine_id` — give D-Bus a machine ID.
 5. `setup_network_and_time` — write Android's DNS servers and timezone into the guest.
-6. `fix_xkb_symlink` — repoint an absolute xkb symlink to a relative one (it's resolved from NDK, not the chroot root).
+6. `setup_cpuinfo` — give the guest a `/proc/cpuinfo` without the CPU model when the kernel has SVE
+   turned off, so llvmpipe's shaders do not use it (`core::cpuinfo`).
+7. `fix_xkb_symlink` — repoint an absolute xkb symlink to a relative one (it's resolved from NDK, not the chroot root).
 
 The first stage is the heaviest: the archive is ~1 GB unpacked. Whether it needs to run is
 decided by a stamp file holding the archive's SHA-256 from its manifest.

@@ -1,0 +1,5 @@
+# Shadows zeitgeist's own service file (the session bus prefers /usr/local/share), which starts the
+# daemon from a shell that waits for it: one more process towards Android's limit of 32.
+[D-BUS Service]
+Name=org.gnome.zeitgeist.Engine
+Exec=/usr/bin/zeitgeist-daemon

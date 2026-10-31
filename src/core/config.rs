@@ -33,13 +33,31 @@ pub const PIPEWIRE_GUEST_RUNTIME_DIR: &str = "/tmp";
 /// PipeWire-Pulse socket as seen from inside the proot guest.
 pub const PULSE_GUEST_SERVER: &str = "unix:/tmp/pulse/native";
 
-/// Whole-number UI scale for the desktop from Android's density scale (dpi / 160).
+/// The smallest desktop, in logical pixels, that the panel, the dock and elementary's windows fit.
+const MIN_DESKTOP_SHORT_SIDE: i32 = 540;
+const MIN_DESKTOP_LONG_SIDE: i32 = 900;
+/// How much denser than Android's own UI the desktop may get to reach that size.
+const MAX_DENSITY_RATIO: f64 = 2.0;
+
+/// Whole-number UI scale for the desktop from Android's density scale (dpi / 160) and the window
+/// size in physical pixels.
 ///
 /// Rounds down unless the density is close to the next step: a 420 dpi phone (2.625) gets 2x, a
 /// 480 dpi one 3x. Rounding to nearest gives 3x at 420 dpi, which leaves a desktop barely 360
-/// logical pixels wide in portrait.
-pub fn guest_ui_scale(scale_factor: f64) -> i32 {
-    ((scale_factor + 0.25).floor() as i32).max(1)
+/// logical pixels wide in portrait. Then it steps down while the desktop would be smaller than
+/// `MIN_DESKTOP_SHORT_SIDE` x `MIN_DESKTOP_LONG_SIDE`, as long as text stays at least half the
+/// size of Android's: dense screens that are small in pixels, like a foldable's cover screen (1116
+/// pixels wide at 520 dpi, so 372 at 3x), get 2x.
+pub fn guest_ui_scale(scale_factor: f64, width: i32, height: i32) -> i32 {
+    let (short_side, long_side) = (width.min(height), width.max(height));
+    let mut scale = ((scale_factor + 0.25).floor() as i32).max(1);
+    while scale > 1
+        && (short_side / scale < MIN_DESKTOP_SHORT_SIDE || long_side / scale < MIN_DESKTOP_LONG_SIDE)
+        && scale_factor / f64::from(scale - 1) <= MAX_DENSITY_RATIO
+    {
+        scale -= 1;
+    }
+    scale
 }
 
 
@@ -262,12 +280,35 @@ mod tests {
 
     #[test]
     fn picks_whole_number_scales() {
-        assert_eq!(guest_ui_scale(1.0), 1); // mdpi
-        assert_eq!(guest_ui_scale(1.5), 1); // hdpi
-        assert_eq!(guest_ui_scale(2.0), 2); // xhdpi
-        assert_eq!(guest_ui_scale(2.625), 2); // 420 dpi
-        assert_eq!(guest_ui_scale(2.75), 3); // 440 dpi
-        assert_eq!(guest_ui_scale(3.5), 3); // 560 dpi
-        assert_eq!(guest_ui_scale(0.75), 1);
+        let (w, h) = (3840, 2400);
+        assert_eq!(guest_ui_scale(1.0, w, h), 1); // mdpi
+        assert_eq!(guest_ui_scale(1.5, w, h), 1); // hdpi
+        assert_eq!(guest_ui_scale(2.0, w, h), 2); // xhdpi
+        assert_eq!(guest_ui_scale(2.625, w, h), 2); // 420 dpi
+        assert_eq!(guest_ui_scale(2.75, w, h), 3); // 440 dpi
+        assert_eq!(guest_ui_scale(3.5, w, h), 3); // 560 dpi
+        assert_eq!(guest_ui_scale(0.75, w, h), 1);
+    }
+
+    #[test]
+    fn keeps_the_desktop_big_enough_to_use() {
+        // OnePlus Open at 520 dpi: cover screen and inner screen.
+        assert_eq!(guest_ui_scale(3.25, 1116, 2484), 2);
+        assert_eq!(guest_ui_scale(3.25, 2268, 2440), 2);
+        // Phones keep 2x in either orientation.
+        assert_eq!(guest_ui_scale(2.625, 1080, 1920), 2);
+        assert_eq!(guest_ui_scale(2.625, 2400, 1080), 2);
+        assert_eq!(guest_ui_scale(3.5, 1440, 3120), 2);
+        // A tablet keeps its density's scale.
+        assert_eq!(guest_ui_scale(2.0, 1600, 2560), 2);
+        // Never below 1x.
+        assert_eq!(guest_ui_scale(2.0, 600, 800), 1);
+    }
+
+    #[test]
+    fn keeps_text_readable_on_small_screens() {
+        // Galaxy Z Fold5 cover screen at 400 dpi: 1x would fit more, with text 2.5 times smaller
+        // than Android's.
+        assert_eq!(guest_ui_scale(2.5, 904, 2316), 2);
     }
 }

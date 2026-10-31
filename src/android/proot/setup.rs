@@ -10,7 +10,10 @@ use crate::{
         utils::application_context::get_application_context,
         utils::ndk::{long_press_timeout_ms, run_in_jvm, scale_factor, touch_slop_px},
     },
-    core::rootfs::{self, RootfsManifest, ROOTFS_ARCHIVE, ROOTFS_MANIFEST},
+    core::{
+        cpuinfo::{guest_cpuinfo, GUEST_CPUINFO},
+        rootfs::{self, RootfsManifest, ROOTFS_ARCHIVE, ROOTFS_MANIFEST},
+    },
 };
 use jni::objects::{JObject, JString};
 use pathdiff::diff_paths;
@@ -303,6 +306,17 @@ fn setup_network_and_time(options: &SetupOptions) -> StageOutput {
     None
 }
 
+/// Give the guest a `/proc/cpuinfo` that keeps llvmpipe from using CPU features the kernel turned
+/// off (see `core::cpuinfo`). Every launch, so it always describes this device.
+fn setup_cpuinfo(_: &SetupOptions) -> StageOutput {
+    let path = get_application_context().rootfs_dir.join(GUEST_CPUINFO);
+    match fs::read_to_string("/proc/cpuinfo") {
+        Ok(host) => replace_file(&path, &guest_cpuinfo(&host)),
+        Err(error) => log::warn!("Failed to read /proc/cpuinfo: {error}"),
+    }
+    None
+}
+
 /// Write `contents` to `path`, replacing a symlink or read-only file left there by the image.
 fn replace_file(path: &Path, contents: &str) {
     let _ = fs::remove_file(path);
@@ -434,6 +448,9 @@ pub fn build_wayland_backend(android_app: AndroidApp) -> WaylandBackend {
         touch_slop_px: touch_slop_px(&android_app),
         long_press_timeout_ms: long_press_timeout_ms(&android_app),
         pointer_pressed: false,
+        touch_fingers: 0,
+        cursor_position: (0.0, 0.0).into(),
+        external_buttons: 0,
         android_app,
     }
 }
@@ -484,7 +501,8 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
         Box::new(setup_home),                   // Step 3. Persistent /home and /etc/localdesktop
         Box::new(setup_machine_id),             // Step 4. Seed /etc/machine-id for D-Bus clients
         Box::new(setup_network_and_time),       // Step 5. DNS servers and timezone from Android
-        Box::new(fix_xkb_symlink),              // Step 6. Fix xkb symlink
+        Box::new(setup_cpuinfo),                // Step 6. /proc/cpuinfo that llvmpipe can trust
+        Box::new(fix_xkb_symlink),              // Step 7. Fix xkb symlink
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {

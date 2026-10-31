@@ -3,7 +3,7 @@ use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
-    input::{self, keyboard::KeyboardHandle, touch::TouchHandle, Seat, SeatHandler, SeatState},
+    input::{keyboard::KeyboardHandle, touch::TouchHandle, Seat, SeatHandler, SeatState},
     output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -30,7 +30,7 @@ use smithay::{
     },
 };
 use smithay::{
-    input::pointer::PointerHandle,
+    input::pointer::{CursorImageStatus, PointerHandle},
     reexports::wayland_server::{
         backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         protocol::{wl_buffer, wl_surface::WlSurface},
@@ -60,6 +60,8 @@ pub struct State {
     pub data_device_state: DataDeviceState,
     pub seat_state: SeatState<Self>,
     pub size: Size<i32, Logical>,
+    /// What the client wants the cursor to look like.
+    pub cursor_image: CursorImageStatus,
 }
 
 impl BufferHandler for State {
@@ -142,7 +144,9 @@ impl SeatHandler for State {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: input::pointer::CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_image = image;
+    }
 }
 
 pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
@@ -215,6 +219,7 @@ impl Compositor {
             data_device_state: DataDeviceState::new::<State>(&dh),
             seat_state,
             size: (1920, 1080).into(),
+            cursor_image: CursorImageStatus::default_named(),
         };
 
         Ok(Compositor {

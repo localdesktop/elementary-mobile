@@ -1,4 +1,6 @@
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::build::{PolarBearApp, PolarBearBackend};
 use crate::android::{
@@ -6,12 +8,12 @@ use crate::android::{
     backend::{
         pipewire_standalone_aaudio,
         wayland::{
-            bind, centralize, centralize_injected_keyboard, handle,
-            write_guest_output_state,
-            CentralizedEvent, State,
+            bind, centralize, centralize_injected_keyboard, handle, on_external_pointer,
+            paint_trackpad, write_guest_output_state, CentralizedEvent, State, WaylandBackend,
         },
         webview::ErrorVariant,
     },
+    external_display,
     proot::{launch::launch, setup::build_wayland_backend},
     utils::{
         ndk::{self, run_in_jvm},
@@ -28,16 +30,22 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
 
-fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBackend) {
+fn configure_output(backend: &mut WaylandBackend) {
     let Some(winit) = backend.graphic_renderer.as_ref() else {
         return;
     };
 
-    let window_size = winit.window_size();
+    let window_size = winit.output_size();
     let size = (window_size.w, window_size.h);
-    // Not `winit.scale_factor()`: that reads `AConfiguration`, which still reports the 160 dpi
-    // default on the first launch and only becomes accurate after a configuration change.
-    let guest_scale_factor = ndk::scale_factor(&backend.android_app);
+    let (guest_scale_factor, refresh_millihz) = match winit.external_surface() {
+        Some(surface) => (
+            (surface.density_dpi as f64 / 160.0).max(1.0),
+            surface.refresh_millihz,
+        ),
+        // Not `winit.scale_factor()`: that reads `AConfiguration`, which still reports the 160
+        // dpi default on the first launch and only becomes accurate after a configuration change.
+        None => (ndk::scale_factor(&backend.android_app), 60000),
+    };
     backend.guest_scale_factor = guest_scale_factor;
     backend.compositor.state.size = size.into();
 
@@ -65,18 +73,57 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
     output.change_current_state(
         Some(Mode {
             size: size.into(),
-            refresh: 60000,
+            refresh: refresh_millihz,
         }),
         Some(Transform::Normal),
         Some(Scale::Integer(1)),
         Some((0, 0).into()),
     );
 
-    let guest_scale = crate::core::config::guest_ui_scale(guest_scale_factor);
+    let guest_scale =
+        crate::core::config::guest_ui_scale(guest_scale_factor, window_size.w, window_size.h);
     write_guest_output_state(window_size.w, window_size.h, guest_scale);
 
     for surface in backend.compositor.state.xdg_shell_state.toplevel_surfaces() {
         configure_toplevel(surface, window_size.w, window_size.h);
+    }
+}
+
+/// Draw to the external monitor if one is connected, otherwise back to the phone's screen.
+fn apply_external_display(backend: &mut WaylandBackend) {
+    let Some(winit) = backend.graphic_renderer.as_mut() else {
+        return;
+    };
+    let surface = external_display::surface();
+    let unchanged = match (&surface, winit.external_surface()) {
+        (Some(new), Some(current)) => Arc::ptr_eq(new, current),
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
+        return;
+    }
+    let attached = match surface {
+        Some(surface) => match winit.attach_external(surface) {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("{error}");
+                false
+            }
+        },
+        None => false,
+    };
+    if !attached {
+        winit.detach_external();
+    }
+    external_display::set_in_use(attached);
+
+    backend.reset_touch_state();
+    configure_output(backend);
+    if attached {
+        let size = backend.compositor.state.size;
+        backend.cursor_position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
+        paint_trackpad(backend);
     }
 }
 
@@ -130,12 +177,20 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                             return;
                         }
                     }
-                } else {
-                    log::info!("Ignoring redundant resume while renderer is already active");
+                } else if let Some(winit) = backend.graphic_renderer.as_mut() {
+                    // Back from the background, where only the external display was drawn to.
+                    if let Err(error) = winit.resume_window() {
+                        log::error!("Failed to draw to the window again on resume: {error}");
+                    }
                 }
 
+                apply_external_display(backend);
                 configure_output(backend);
+                if backend.is_trackpad() {
+                    paint_trackpad(backend);
+                }
                 accessibility::set_runtime_active(true);
+                run_in_jvm(external_display::start, self.frontend.android_app.clone());
 
                 if let Some(winit) = backend.graphic_renderer.as_ref() {
                     winit.window().request_redraw();
@@ -156,8 +211,9 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                     |env, _| close_webview_popups(env),
                     self.frontend.android_app.clone(),
                 );
-                self.backend =
-                    PolarBearBackend::Wayland(build_wayland_backend(self.frontend.android_app.clone()));
+                self.backend = PolarBearBackend::Wayland(build_wayland_backend(
+                    self.frontend.android_app.clone(),
+                ));
                 // Same as coming back to the app: bind the renderer and start the session. If the
                 // app is in the background, this fails quietly and the next resume does it.
                 self.resumed(event_loop);
@@ -170,14 +226,40 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
             return;
         };
 
-        for event in accessibility::drain_pending_events() {
-            let event = centralize_injected_keyboard(
-                event.scancode,
-                event.state,
-                event.event_time_ms,
-                backend,
-            );
-            handle(event, backend, event_loop);
+        match event {
+            AppUserEvent::ExternalDisplayChanged => {
+                apply_external_display(backend);
+                handle(CentralizedEvent::Redraw, backend, event_loop);
+            }
+            AppUserEvent::ExternalPointer => {
+                for event in external_display::drain_pointer_events() {
+                    on_external_pointer(backend, event);
+                }
+            }
+            _ => {
+                for event in accessibility::drain_pending_events() {
+                    let event = centralize_injected_keyboard(
+                        event.scancode,
+                        event.state,
+                        event.event_time_ms,
+                        backend,
+                    );
+                    handle(event, backend, event_loop);
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // In the background the window no longer asks for redraws, but the desktop is still on
+        // the external display.
+        if let PolarBearBackend::Wayland(backend) = &mut self.backend {
+            if backend.is_trackpad() && !backend.window_visible() {
+                handle(CentralizedEvent::Redraw, backend, event_loop);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ));
+            }
         }
     }
 
@@ -208,10 +290,25 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
         event_loop.set_control_flow(ControlFlow::Wait);
 
         if let PolarBearBackend::Wayland(backend) = &mut self.backend {
-            backend.graphic_renderer = None;
             backend.key_counter = 0;
             backend.reset_touch_state();
             backend.pointer_pressed = false;
+
+            if backend.is_trackpad() {
+                // The monitor stays a desktop display, for a mouse and keyboard on it.
+                if let Some(winit) = backend.graphic_renderer.as_mut() {
+                    winit.suspend_window();
+                }
+                run_in_jvm(
+                    external_display::background,
+                    self.frontend.android_app.clone(),
+                );
+                return;
+            }
+
+            backend.graphic_renderer = None;
+            external_display::set_in_use(false);
+            run_in_jvm(external_display::stop, self.frontend.android_app.clone());
             // Kill the standalone-client PipeWire/AAudio backend if it was started.
             pipewire_standalone_aaudio::shutdown();
         }
