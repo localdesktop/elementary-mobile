@@ -1,5 +1,5 @@
 use crate::android::utils::application_context::get_application_context;
-use crate::core::cpuinfo::GUEST_CPUINFO;
+use crate::core::cpuinfo::{kernel_enables_sve, GUEST_CPUINFO};
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -137,7 +137,10 @@ impl GuestProcess {
             .arg("--bind=/dev/tty:/dev/tty")
             // User data and settings live outside the OS so that an update replacing it keeps them.
             .arg(format!("--bind={}:/home", context.home_dir.display()))
-            .arg(format!("--bind={}:/etc/localdesktop", context.config_dir.display()));
+            .arg(format!(
+                "--bind={}:/etc/localdesktop",
+                context.config_dir.display()
+            ));
 
         if context.permission_all_files_access {
             process
@@ -177,6 +180,10 @@ impl GuestProcess {
             .arg("TMPDIR=/tmp")
             .arg(format!("USER={}", user))
             .arg(format!("LOGNAME={}", user));
+        // See `core::cpuinfo`: llvmpipe's optimised shaders still crash Gala on these devices.
+        if !kernel_enables_sve(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()) {
+            process.arg("GALLIVM_PERF=nopt");
+        }
 
         // user shell
         if user == "root" {

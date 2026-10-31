@@ -8,6 +8,10 @@
 //!
 //! Without the `CPU part` lines LLVM targets a generic Armv8 CPU, which every arm64 device runs.
 //! The `Features` lines, which say what the kernel really enables, are kept.
+//!
+//! That is not always enough: on a OnePlus Open driving a 4K monitor, Gala still died with SIGILL
+//! until llvmpipe stopped running LLVM's optimisation passes (`GALLIVM_PERF=nopt`), so the guest
+//! gets that too on these devices. It costs little for a 2D desktop.
 
 /// Where the app writes the guest's `/proc/cpuinfo`, relative to the root filesystem.
 pub const GUEST_CPUINFO: &str = "proc/.cpuinfo";
@@ -24,7 +28,7 @@ pub fn guest_cpuinfo(host: &str) -> String {
 }
 
 /// Whether every CPU lists SVE among the features the kernel enables.
-fn kernel_enables_sve(cpuinfo: &str) -> bool {
+pub fn kernel_enables_sve(cpuinfo: &str) -> bool {
     let mut features = cpuinfo
         .lines()
         .filter_map(|line| line.strip_prefix("Features"))
